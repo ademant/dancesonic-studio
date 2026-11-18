@@ -1,0 +1,17 @@
+[package]
+name = "studio-core"
+description = "DanceSonic Studio core: server clients, database, sync and protocol, without UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "studio_core"
+
+[dependencies]
+
+[lints]
+workspace = true
