@@ -4,8 +4,10 @@
 //! queue and the remote control protocol live here, so they can be tested
 //! without GTK or GStreamer.
 
+pub mod account;
 pub mod catalog;
 pub mod db;
+pub mod secrets;
 pub mod sync;
 
 /// Application ID, used for the GTK application, the desktop file and D-Bus.

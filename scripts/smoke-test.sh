@@ -11,6 +11,10 @@ seconds=${SMOKE_SECONDS:-5}
 # Headless displays have no GPU; software rendering avoids Vulkan/EGL noise and flakiness.
 export GSK_RENDERER=cairo
 
+# Keep the database and other data out of the real home directory.
+data=$(mktemp -d)
+export XDG_DATA_HOME="$data"
+
 # timeout(1) exits with 124 when it had to stop a program that was still running:
 # that is the success case here.
 expect_running() {
@@ -30,7 +34,7 @@ runtime=$(mktemp -d)
 chmod 700 "$runtime"
 XDG_RUNTIME_DIR=$runtime weston --backend=headless --socket=smoke-wayland --idle-time=0 &
 weston_pid=$!
-trap 'kill "$weston_pid" 2>/dev/null || true; rm -rf "$runtime"' EXIT
+trap 'kill "$weston_pid" 2>/dev/null || true; rm -rf "$runtime" "$data"' EXIT
 i=0
 until [ -S "$runtime/smoke-wayland" ]; do
     i=$((i + 1))
