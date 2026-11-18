@@ -12,6 +12,14 @@ publish.workspace = true
 name = "studio_core"
 
 [dependencies]
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled", "cache"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync", "macros"] }
+tracing = "0.1.44"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros"] }

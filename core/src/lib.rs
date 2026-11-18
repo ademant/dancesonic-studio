@@ -4,6 +4,10 @@
 //! queue and the remote control protocol live here, so they can be tested
 //! without GTK or GStreamer.
 
+pub mod catalog;
+pub mod db;
+pub mod sync;
+
 /// Application ID, used for the GTK application, the desktop file and D-Bus.
 pub const APP_ID: &str = "io.github.ademant.DanceSonicStudio";
 
