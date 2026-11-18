@@ -1,0 +1,26 @@
+[package]
+name = "studio-core"
+description = "DanceSonic Studio core: server clients, database, sync and protocol, without UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "studio_core"
+
+[dependencies]
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled", "cache"] }
+secrecy = "0.10.3"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync", "macros"] }
+tracing = "0.1.44"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros"] }
