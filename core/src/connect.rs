@@ -6,15 +6,16 @@
 
 use std::sync::Arc;
 
-use secrecy::SecretSlice;
+use secrecy::{ExposeSecret, SecretSlice};
 
 use crate::catalog::{self, ApplyReport, ServerId};
 use crate::connection::ServerUrl;
 use crate::db::{Database, DbError};
+use crate::dpop::{DeviceKey, DpopError};
 use crate::http::{self, HttpError, HttpSettings};
 use crate::library_feed::{FEED_EXTENSION, LibrarySource};
 use crate::secrets::{SecretBackend, SecretError, SecretId, SecretKind, SecretVault};
-use crate::subsonic::{ApiError, ApiKey, Auth, ServerInfo, SubsonicClient};
+use crate::subsonic::{ApiError, ApiKey, ApiKeyError, Auth, ServerInfo, SubsonicClient};
 use crate::sync::{self, SyncError};
 
 /// The extension a server must advertise for API-key sign-in.
@@ -43,18 +44,31 @@ pub enum ConnectError {
     Sync(#[from] SyncError),
     #[error("the database task stopped unexpectedly")]
     Task(#[from] tokio::task::JoinError),
+    #[error("the stored credential is not valid")]
+    BadStoredSecret,
+    #[error(transparent)]
+    Key(#[from] ApiKeyError),
+    #[error(transparent)]
+    Device(#[from] DpopError),
 }
 
-/// Connects to `server` with `key`, stores the key and syncs the catalog.
-pub async fn connect_with_api_key<B: SecretBackend>(
+/// Connects to `server` with the given credentials, stores them and syncs the
+/// catalog.
+///
+/// The server is checked first, and the credentials are stored only once it
+/// has accepted them. A paired device replaces the API key for the server, so
+/// the local copy of that key is removed. The key itself stays valid on the
+/// server until the user revokes it on the account page: a device cannot
+/// revoke keys.
+pub async fn connect<B: SecretBackend>(
     settings: &HttpSettings,
     vault: &SecretVault<B>,
     db: Arc<Database>,
     server: ServerUrl,
-    key: ApiKey,
+    auth: Auth,
 ) -> Result<Connected, ConnectError> {
     let http = http::client(settings)?;
-    let probe = SubsonicClient::new(http.clone(), server.clone(), Auth::ApiKey(key.clone()));
+    let probe = SubsonicClient::new(http.clone(), server.clone(), auth.clone());
 
     let info = probe.server_info().await?;
     if !info.has_extension(AUTH_EXTENSION) {
@@ -64,10 +78,22 @@ pub async fn connect_with_api_key<B: SecretBackend>(
         return Err(ApiError::Missing(FEED_EXTENSION).into());
     }
 
-    // The server has accepted the key, so it is safe to keep it.
-    let id = SecretId::new(SecretKind::ServerApiKey, server.key())?;
-    let secret = SecretSlice::from(key.expose().as_bytes().to_vec());
-    vault.store(&id, &secret).await?;
+    // The server has accepted these credentials, so it is safe to keep them.
+    let (kind, secret) = match &auth {
+        Auth::ApiKey(key) => (
+            SecretKind::ServerApiKey,
+            SecretSlice::from(key.expose().as_bytes().to_vec()),
+        ),
+        Auth::Device(device) => (SecretKind::ServerDeviceKey, device.secret()),
+    };
+    vault
+        .store(&SecretId::new(kind, server.key())?, &secret)
+        .await?;
+    if matches!(auth, Auth::Device(_)) {
+        vault
+            .delete(&SecretId::new(SecretKind::ServerApiKey, server.key())?)
+            .await?;
+    }
 
     let server_id = {
         let db = Arc::clone(&db);
@@ -85,11 +111,44 @@ pub async fn connect_with_api_key<B: SecretBackend>(
     })
 }
 
+/// Connects with an API key. See [`connect`].
+pub async fn connect_with_api_key<B: SecretBackend>(
+    settings: &HttpSettings,
+    vault: &SecretVault<B>,
+    db: Arc<Database>,
+    server: ServerUrl,
+    key: ApiKey,
+) -> Result<Connected, ConnectError> {
+    connect(settings, vault, db, server, Auth::ApiKey(key)).await
+}
+
+/// The credentials stored for a server: the paired device when there is one,
+/// otherwise the API key. `None` when the server was never connected.
+pub async fn saved_auth<B: SecretBackend>(
+    vault: &SecretVault<B>,
+    server: &ServerUrl,
+) -> Result<Option<Auth>, ConnectError> {
+    let device_id = SecretId::new(SecretKind::ServerDeviceKey, server.key())?;
+    if let Some(secret) = vault.read(&device_id).await? {
+        return Ok(Some(Auth::Device(DeviceKey::from_secret(&secret)?)));
+    }
+    let key_id = SecretId::new(SecretKind::ServerApiKey, server.key())?;
+    match vault.read(&key_id).await? {
+        Some(secret) => {
+            let text = std::str::from_utf8(secret.expose_secret())
+                .map_err(|_| ConnectError::BadStoredSecret)?;
+            Ok(Some(Auth::ApiKey(ApiKey::new(text)?)))
+        }
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::connection::HttpPolicy;
     use crate::db::tests::temp_db;
+    use crate::dpop::DeviceKey;
     use crate::secrets::BackendError;
     use secrecy::ExposeSecret;
     use serde_json::json;
@@ -279,5 +338,90 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+    #[tokio::test]
+    async fn a_paired_device_replaces_the_api_key_and_signs_every_request() {
+        let server = MockServer::start().await;
+        mount_server(&server, full_extensions()).await;
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let vault = SecretVault::with_backend(MemoryBackend::default());
+        let url = ServerUrl::parse(&server.uri(), HttpPolicy::ALLOW_PRIVATE_HTTP).unwrap();
+
+        // An API key from an earlier connection is replaced by the device.
+        connect_with_api_key(
+            &settings(),
+            &vault,
+            Arc::clone(&db),
+            url.clone(),
+            ApiKey::new("tsk_old_key").unwrap(),
+        )
+        .await
+        .unwrap();
+        let requests_before_device = server.received_requests().await.unwrap().len();
+        let device = DeviceKey::generate().unwrap();
+        connect(
+            &settings(),
+            &vault,
+            Arc::clone(&db),
+            url.clone(),
+            Auth::Device(device.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            vault
+                .read(&SecretId::new(SecretKind::ServerApiKey, url.key()).unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "the old API key must not stay in the Secret Service"
+        );
+        match saved_auth(&vault, &url).await.unwrap() {
+            Some(Auth::Device(restored)) => {
+                assert_eq!(restored.thumbprint(), device.thumbprint());
+            }
+            other => panic!("expected the device, got {other:?}"),
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.len() > requests_before_device);
+        for request in &requests[requests_before_device..] {
+            assert!(request.headers.get("DPoP").is_some(), "{}", request.url);
+            assert!(request.headers.get("X-Api-Key").is_none());
+            assert!(!request.url.to_string().contains("apiKey"));
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_auth_prefers_the_device_and_is_none_for_unknown_servers() {
+        let vault = SecretVault::with_backend(MemoryBackend::default());
+        let url = ServerUrl::parse("https://music.example", HttpPolicy::HTTPS_ONLY).unwrap();
+        assert!(saved_auth(&vault, &url).await.unwrap().is_none());
+
+        vault
+            .store(
+                &SecretId::new(SecretKind::ServerApiKey, url.key()).unwrap(),
+                &SecretSlice::from(b"tsk_stored".to_vec()),
+            )
+            .await
+            .unwrap();
+        match saved_auth(&vault, &url).await.unwrap() {
+            Some(Auth::ApiKey(key)) => assert_eq!(key.expose(), "tsk_stored"),
+            other => panic!("expected the API key, got {other:?}"),
+        }
+
+        vault
+            .store(
+                &SecretId::new(SecretKind::ServerDeviceKey, url.key()).unwrap(),
+                &DeviceKey::generate().unwrap().secret(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            saved_auth(&vault, &url).await.unwrap(),
+            Some(Auth::Device(_))
+        ));
     }
 }

@@ -8,6 +8,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 use crate::connection::ServerUrl;
+use crate::dpop::DeviceKey;
 
 /// Client name sent as `c`.
 pub const CLIENT_NAME: &str = "DanceSonicStudio";
@@ -77,6 +78,9 @@ impl std::fmt::Debug for ApiKey {
 pub enum Auth {
     /// The key in the `X-Api-Key` header.
     ApiKey(ApiKey),
+    /// A paired device: a DPoP proof per request, signed with the device key.
+    /// No bearer secret is sent.
+    Device(DeviceKey),
 }
 
 /// Errors from a server call. Messages never contain keys or full URLs.
@@ -100,6 +104,8 @@ pub enum ApiError {
     TooLarge,
     #[error("the server does not offer {0}")]
     Missing(&'static str),
+    #[error("the device key could not sign the request")]
+    Signing,
 }
 
 /// What the server says about itself, from `getOpenSubsonicExtensions`.
@@ -203,10 +209,16 @@ impl SubsonicClient {
                 pairs.append_pair(name, value);
             }
         }
-        let mut request = self.http.get(url);
-        request = match &self.auth {
-            Auth::ApiKey(key) => request.header("X-Api-Key", key.expose()),
+        let credential = match &self.auth {
+            Auth::ApiKey(key) => ("X-Api-Key", key.expose().to_owned()),
+            Auth::Device(device) => {
+                let proof = device
+                    .proof("GET", &url, crate::sync::now_ms() / 1000)
+                    .map_err(|_| ApiError::Signing)?;
+                ("DPoP", proof)
+            }
         };
+        let request = self.http.get(url).header(credential.0, credential.1);
         let response = request.send().await.map_err(map_transport)?;
         let status = response.status();
         if !status.is_success() {

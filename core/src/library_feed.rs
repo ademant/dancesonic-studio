@@ -403,7 +403,7 @@ fn to_source_error(error: ApiError) -> SourceError {
     match error {
         ApiError::Unreachable | ApiError::Timeout => SourceError::Unreachable(error.to_string()),
         ApiError::Http(_) | ApiError::Refused { .. } => SourceError::Refused(error.to_string()),
-        ApiError::Invalid(_) | ApiError::TooLarge | ApiError::Missing(_) => {
+        ApiError::Invalid(_) | ApiError::TooLarge | ApiError::Missing(_) | ApiError::Signing => {
             SourceError::Invalid(error.to_string())
         }
     }
