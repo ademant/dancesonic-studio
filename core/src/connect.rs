@@ -1,6 +1,6 @@
 //! Connecting Studio to a server with an API key.
 //!
-//! The server is checked first: it must advertise `apikeyauth` and the change
+//! The server is checked first: it must advertise `apiKeyAuthentication` and the change
 //! feed. Only when it accepts the key is the key stored, and only then is the
 //! catalog synced. A refused connection leaves no secret and no catalog behind.
 
@@ -19,7 +19,7 @@ use crate::subsonic::{ApiError, ApiKey, ApiKeyError, Auth, ServerInfo, SubsonicC
 use crate::sync::{self, SyncError};
 
 /// The extension a server must advertise for API-key sign-in.
-pub const AUTH_EXTENSION: &str = "apikeyauth";
+pub const AUTH_EXTENSION: &str = "apiKeyAuthentication";
 
 /// What a successful connection produced.
 #[derive(Debug)]
@@ -145,6 +145,14 @@ pub async fn saved_auth<B: SecretBackend>(
 
 #[cfg(test)]
 mod tests {
+    /// The name must match the OpenSubsonic extension folksonic advertises
+    /// (`getOpenSubsonicExtensions`). It was once `apikeyauth`, which no server
+    /// sends, so every API-key connection was refused.
+    #[test]
+    fn the_auth_extension_has_the_name_servers_advertise() {
+        assert_eq!(AUTH_EXTENSION, "apiKeyAuthentication");
+    }
+
     use super::*;
     use crate::connection::HttpPolicy;
     use crate::db::tests::temp_db;
@@ -222,7 +230,7 @@ mod tests {
 
     fn full_extensions() -> serde_json::Value {
         json!([
-            {"name": "apikeyauth", "versions": [1]},
+            {"name": "apiKeyAuthentication", "versions": [1]},
             {"name": "tinysonicLibraryChanges", "versions": [1, 2]}
         ])
     }
@@ -258,7 +266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_server_without_apikeyauth_is_refused_and_stores_nothing() {
+    async fn a_server_without_api_key_authentication_is_refused_and_stores_nothing() {
         let server = MockServer::start().await;
         mount_server(
             &server,
@@ -278,7 +286,7 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(ConnectError::Api(ApiError::Missing("apikeyauth")))
+            Err(ConnectError::Api(ApiError::Missing("apiKeyAuthentication")))
         ));
         assert!(
             vault
@@ -292,7 +300,11 @@ mod tests {
     #[tokio::test]
     async fn a_server_without_the_change_feed_is_refused() {
         let server = MockServer::start().await;
-        mount_server(&server, json!([{"name": "apikeyauth", "versions": [1]}])).await;
+        mount_server(
+            &server,
+            json!([{"name": "apiKeyAuthentication", "versions": [1]}]),
+        )
+        .await;
         let (_dir, db) = temp_db();
         let vault = SecretVault::with_backend(MemoryBackend::default());
         let url = ServerUrl::parse(&server.uri(), HttpPolicy::ALLOW_PRIVATE_HTTP).unwrap();
