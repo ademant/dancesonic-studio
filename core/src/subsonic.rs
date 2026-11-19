@@ -209,15 +209,7 @@ impl SubsonicClient {
                 pairs.append_pair(name, value);
             }
         }
-        let credential = match &self.auth {
-            Auth::ApiKey(key) => ("X-Api-Key", key.expose().to_owned()),
-            Auth::Device(device) => {
-                let proof = device
-                    .proof("GET", &url, crate::sync::now_ms() / 1000)
-                    .map_err(|_| ApiError::Signing)?;
-                ("DPoP", proof)
-            }
-        };
+        let credential = credential(&self.auth, "GET", &url)?;
         let request = self.http.get(url).header(credential.0, credential.1);
         let response = request.send().await.map_err(map_transport)?;
         let status = response.status();
@@ -257,6 +249,24 @@ async fn read_limited(mut response: reqwest::Response) -> Result<Vec<u8>, ApiErr
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// The credential header for one request: the key, or a DPoP proof that names
+/// this request. Shared by every client that talks to the server.
+pub(crate) fn credential(
+    auth: &Auth,
+    method: &str,
+    url: &url::Url,
+) -> Result<(&'static str, String), ApiError> {
+    match auth {
+        Auth::ApiKey(key) => Ok(("X-Api-Key", key.expose().to_owned())),
+        Auth::Device(device) => {
+            let proof = device
+                .proof(method, url, crate::sync::now_ms() / 1000)
+                .map_err(|_| ApiError::Signing)?;
+            Ok(("DPoP", proof))
+        }
+    }
 }
 
 /// The Subsonic JSON envelope: `{"subsonic-response": {...}}`.

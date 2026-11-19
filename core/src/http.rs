@@ -55,15 +55,36 @@ fn pinned_certificates(pem: &[u8]) -> Result<Vec<Certificate>, HttpError> {
         .collect()
 }
 
+/// Longest a stream may go without any bytes arriving.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Builds the client for one server.
 pub fn client(settings: &HttpSettings) -> Result<reqwest::Client, HttpError> {
+    build(settings, Some(REQUEST_TIMEOUT))
+}
+
+/// Builds the client for audio streams. A track is much bigger than an
+/// answer, so there is no cap on the whole request; a stalled stream is cut
+/// off after [`STREAM_IDLE_TIMEOUT`] without data instead. The other rules
+/// are the same as [`client`].
+pub fn streaming_client(settings: &HttpSettings) -> Result<reqwest::Client, HttpError> {
+    build(settings, None)
+}
+
+fn build(
+    settings: &HttpSettings,
+    total_timeout: Option<Duration>,
+) -> Result<reqwest::Client, HttpError> {
     let mut builder = reqwest::Client::builder()
         .https_only(!settings.policy.allows_plain_http())
         .redirect(redirect::Policy::none())
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
         .user_agent(concat!("DanceSonicStudio/", env!("CARGO_PKG_VERSION")));
+    builder = match total_timeout {
+        Some(timeout) => builder.timeout(timeout),
+        None => builder.read_timeout(STREAM_IDLE_TIMEOUT),
+    };
     if let Some(pem) = &settings.pinned_certificate_pem {
         builder = builder.tls_certs_only(pinned_certificates(pem)?);
     }
@@ -168,6 +189,7 @@ mod tests {
     #[test]
     fn default_client_builds() {
         assert!(client(&HttpSettings::default()).is_ok());
+        assert!(streaming_client(&HttpSettings::default()).is_ok());
     }
 
     #[test]

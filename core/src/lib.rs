@@ -14,10 +14,13 @@ pub mod dpop;
 pub mod http;
 pub mod library_feed;
 pub mod pairing;
+pub mod queue;
 pub mod secrets;
 pub mod sign_in;
+pub mod stream_proxy;
 pub mod subsonic;
 pub mod sync;
+pub mod tempo;
 
 /// Application ID, used for the GTK application, the desktop file and D-Bus.
 pub const APP_ID: &str = "io.github.ademant.DanceSonicStudio";
