@@ -61,6 +61,8 @@ struct Inner {
     tracks: Vec<Track>,
     proxy: Option<Rc<StreamProxy>>,
     rate: Rate,
+    /// The user paused. Buffering must not resume a pause the user asked for.
+    user_paused: bool,
     on_event: Rc<dyn Fn(PlayerEvent)>,
 }
 
@@ -114,12 +116,16 @@ impl Player {
             .build()
             .map_err(|err| PlayerError::Start(format!("scaletempo: {err}")))?;
         playbin.set_property("audio-filter", &scaletempo);
+        // Apply a new uri at once, so the switch in about-to-finish is not
+        // deferred to end of stream (GStreamer 1.22 and later).
+        playbin.set_property("instant-uri", true);
 
         let inner = Rc::new(RefCell::new(Inner {
             queue: PlayQueue::new(),
             tracks: Vec::new(),
             proxy: None,
             rate: Rate::NORMAL,
+            user_paused: false,
             on_event: Rc::new(on_event),
         }));
         let prepared_next: Arc<Mutex<Option<String>>> = Arc::default();
@@ -155,6 +161,19 @@ impl Player {
                         let switched_now = switched.swap(false, Ordering::SeqCst);
                         if let (true, Some(playbin)) = (switched_now, weak.upgrade()) {
                             on_gapless_switch(&playbin, &inner, &prepared);
+                        }
+                    }
+                    gst::MessageView::Buffering(buffering) => {
+                        // Network sources: hold playback until the buffer is full.
+                        if !inner.borrow().user_paused
+                            && let Some(playbin) = weak.upgrade()
+                        {
+                            let state = if buffering.percent() < 100 {
+                                gst::State::Paused
+                            } else {
+                                gst::State::Playing
+                            };
+                            let _ = playbin.set_state(state);
                         }
                     }
                     gst::MessageView::Eos(_) => {
@@ -211,6 +230,8 @@ impl Player {
             let index = inner.queue.current_index().ok_or(QueueError::NoSuchIndex)?;
             (inner.uri_for(index)?, index, inner.rate)
         };
+        // A new track plays unless the user pauses it again.
+        self.inner.borrow_mut().user_paused = false;
         self.playbin
             .set_state(gst::State::Null)
             .map_err(|err| PlayerError::Engine(err.to_string()))?;
@@ -251,6 +272,7 @@ impl Player {
     }
 
     pub(crate) fn pause(&self) -> Result<(), PlayerError> {
+        self.inner.borrow_mut().user_paused = true;
         self.playbin
             .set_state(gst::State::Paused)
             .map_err(|err| PlayerError::Engine(err.to_string()))?;
@@ -258,6 +280,7 @@ impl Player {
     }
 
     pub(crate) fn resume(&self) -> Result<(), PlayerError> {
+        self.inner.borrow_mut().user_paused = false;
         self.playbin
             .set_state(gst::State::Playing)
             .map_err(|err| PlayerError::Engine(err.to_string()))?;
@@ -340,15 +363,24 @@ fn apply_replay_gain(playbin: &gst::Element, inner: &Inner, index: usize) {
     playbin.set_property("volume", replay_volume(track.gain_db, track.peak));
 }
 
+/// Seeks to `position_ms` at `rate`. The event goes to the audio sink, not to
+/// playbin, so one seek is performed (GStreamer's playback-speed guidance).
+/// Falls back to playbin before the sink exists.
 fn seek_with_rate(playbin: &gst::Element, position_ms: u64, rate: Rate) -> Result<(), PlayerError> {
-    playbin
-        .seek(
-            rate.factor(),
-            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-            gst::SeekType::Set,
-            gst::ClockTime::from_mseconds(position_ms),
-            gst::SeekType::None,
-            gst::ClockTime::NONE,
-        )
-        .map_err(|err| PlayerError::Engine(err.to_string()))
+    let target = playbin
+        .property::<Option<gst::Element>>("audio-sink")
+        .unwrap_or_else(|| playbin.clone());
+    let event = gst::event::Seek::new(
+        rate.factor(),
+        gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+        gst::SeekType::Set,
+        gst::ClockTime::from_mseconds(position_ms),
+        gst::SeekType::None,
+        gst::ClockTime::NONE,
+    );
+    if target.send_event(event) {
+        Ok(())
+    } else {
+        Err(PlayerError::Engine("the seek was refused".to_owned()))
+    }
 }
