@@ -6,8 +6,16 @@
 
 pub mod account;
 pub mod catalog;
+pub mod connect;
+pub mod connection;
 pub mod db;
+pub mod dpop;
+pub mod http;
+pub mod library_feed;
+pub mod pairing;
 pub mod secrets;
+pub mod sign_in;
+pub mod subsonic;
 pub mod sync;
 
 /// Application ID, used for the GTK application, the desktop file and D-Bus.

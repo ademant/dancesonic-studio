@@ -15,6 +15,9 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # Mozilla root certificate data, bundled by reqwest's TLS verifier. A permissive
+    # data license, compatible with AGPL-3.0; see the commit that added reqwest.
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MPL-2.0",

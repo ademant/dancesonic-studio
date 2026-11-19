@@ -1,5 +1,6 @@
 //! DanceSonic Studio: the GTK4 user interface.
 
+mod connection_dialog;
 mod secret_service;
 
 use std::cell::RefCell;
@@ -18,12 +19,8 @@ use tracing_subscriber::EnvFilter;
 use crate::secret_service::SecretService;
 
 /// What the app opens at start and keeps for its lifetime.
-#[derive(Debug)]
-#[expect(
-    dead_code,
-    reason = "used by the server connection (#3) and the main window (#8)"
-)]
-struct Services {
+#[derive(Clone, Debug)]
+pub(crate) struct Services {
     vault: Arc<SecretVault<SecretService>>,
     db: Arc<Database>,
 }
@@ -83,6 +80,23 @@ fn activate(
         .default_height(800)
         .child(&content)
         .build();
+
+    let connect_button = gtk::Button::with_label("Connect…");
+    let header = gtk::HeaderBar::new();
+    header.pack_start(&connect_button);
+    window.set_titlebar(Some(&header));
+    let parent = window.clone();
+    let dialog_runtime = Arc::clone(runtime);
+    let dialog_services = Rc::clone(services);
+    let dialog_banner = banner.clone();
+    connect_button.connect_clicked(move |_| {
+        let ready = dialog_services.borrow().clone();
+        match ready {
+            Some(ready) => connection_dialog::present(&parent, &dialog_runtime, ready),
+            None => dialog_banner.show("Studio is still starting. Try again in a moment."),
+        }
+    });
+
     window.present();
 
     start_services(runtime, Rc::clone(services), banner);
