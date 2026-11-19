@@ -16,6 +16,7 @@ use url::Url;
 
 use crate::connection::{HttpPolicy, ServerUrl, UrlError};
 use crate::dpop::{DeviceKey, DpopError, verification_code};
+use crate::http::{BodyError, MAX_AUTH_BODY_BYTES, read_body};
 
 /// Name sent for the device; shown on the account page.
 pub const DEVICE_NAME: &str = "DanceSonic Studio";
@@ -182,6 +183,8 @@ pub enum PairingError {
     Timeout,
     #[error("the server sent an invalid answer")]
     Invalid,
+    #[error("the server sent an answer that is too large")]
+    TooLarge,
     #[error("the server refused the request (HTTP {0})")]
     Http(u16),
     #[error(transparent)]
@@ -368,7 +371,8 @@ impl PendingPairing {
         match response.status().as_u16() {
             200 => Ok(Some(read_json(response).await?)),
             401 => {
-                let text = response.text().await.unwrap_or_default();
+                let bytes = read_answer(response).await?;
+                let text = String::from_utf8_lossy(&bytes);
                 if text.contains("pairing_rejected") {
                     Err(PairingError::Rejected)
                 } else if text.contains("pairing_expired") {
@@ -473,8 +477,18 @@ fn map_transport(error: reqwest::Error) -> PairingError {
 async fn read_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, PairingError> {
-    let bytes = response.bytes().await.map_err(map_transport)?;
+    let bytes = read_answer(response).await?;
     serde_json::from_slice(&bytes).map_err(|_| PairingError::Invalid)
+}
+
+/// Reads an answer body within [`MAX_AUTH_BODY_BYTES`].
+async fn read_answer(response: reqwest::Response) -> Result<Vec<u8>, PairingError> {
+    read_body(response, MAX_AUTH_BODY_BYTES)
+        .await
+        .map_err(|error| match error {
+            BodyError::TooLarge => PairingError::TooLarge,
+            BodyError::Transport(err) => map_transport(err),
+        })
 }
 
 #[cfg(test)]
@@ -659,6 +673,27 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn an_oversized_pairing_answer_is_refused() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/pair/complete"))
+                .respond_with(ResponseTemplate::new(202).set_body_bytes(vec![
+                    b'x';
+                    MAX_AUTH_BODY_BYTES
+                        + 1
+                ]))
+                .mount(&server)
+                .await;
+            let result = PendingPairing::begin(
+                &http(),
+                server_url(&server).await,
+                PairingToken::new(TOKEN).unwrap(),
+            )
+            .await;
+            assert!(matches!(result, Err(PairingError::TooLarge)));
+        }
+
+        #[tokio::test]
         async fn begin_sends_only_the_public_key_and_derives_the_code() {
             let server = MockServer::start().await;
             let pending = begin_with(&server, "2999-01-01T00:00:00Z").await;
@@ -782,6 +817,26 @@ mod tests {
                     "{body}"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn an_oversized_refusal_answer_is_refused_not_read() {
+            let server = MockServer::start().await;
+            let pending = begin_with(&server, "2999-01-01T00:00:00Z").await;
+            Mock::given(method("GET"))
+                .and(path("/api/device/me"))
+                .respond_with(ResponseTemplate::new(401).set_body_bytes(vec![
+                    b'x';
+                    MAX_AUTH_BODY_BYTES
+                        + 1
+                ]))
+                .mount(&server)
+                .await;
+            let error = pending
+                .wait_for_owner_with(&http(), &[Duration::from_millis(5)])
+                .await
+                .unwrap_err();
+            assert!(matches!(error, PairingError::TooLarge), "{error:?}");
         }
 
         #[tokio::test]

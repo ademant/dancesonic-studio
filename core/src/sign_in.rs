@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::connection::ServerUrl;
+use crate::http::{BodyError, MAX_AUTH_BODY_BYTES, read_body};
 use crate::subsonic::{ApiKey, ApiKeyError};
 
 /// Name of the key created for Studio, as shown on the account page.
@@ -39,6 +40,8 @@ pub enum SignInError {
     Http(u16),
     #[error("the server sent an invalid answer")]
     Invalid,
+    #[error("the server sent an answer that is too large")]
+    TooLarge,
     #[error(transparent)]
     Key(#[from] ApiKeyError),
 }
@@ -160,7 +163,8 @@ async fn post_json<B: Serialize, T: serde::de::DeserializeOwned>(
         429 => {
             // The server answers `server_busy` when its password checks are
             // all in use; the other 429 is the per-address limit.
-            let text = response.text().await.unwrap_or_default();
+            let bytes = read_answer(response).await?;
+            let text = String::from_utf8_lossy(&bytes);
             return Err(if text.contains("server_busy") {
                 SignInError::Busy
             } else {
@@ -170,8 +174,18 @@ async fn post_json<B: Serialize, T: serde::de::DeserializeOwned>(
         503 => return Err(SignInError::Busy),
         other => return Err(SignInError::Http(other)),
     }
-    let bytes = response.bytes().await.map_err(map_transport)?;
+    let bytes = read_answer(response).await?;
     serde_json::from_slice(&bytes).map_err(|_| SignInError::Invalid)
+}
+
+/// Reads an answer body within [`MAX_AUTH_BODY_BYTES`].
+async fn read_answer(response: reqwest::Response) -> Result<Vec<u8>, SignInError> {
+    read_body(response, MAX_AUTH_BODY_BYTES)
+        .await
+        .map_err(|error| match error {
+            BodyError::TooLarge => SignInError::TooLarge,
+            BodyError::Transport(err) => map_transport(err),
+        })
 }
 
 fn map_transport(error: reqwest::Error) -> SignInError {
@@ -325,6 +339,74 @@ mod tests {
             exchange_password(&http(), &url, "ada", &pw).await,
             Err(SignInError::RateLimited)
         ));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_success_answer_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/login"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_AUTH_BODY_BYTES + 1]),
+            )
+            .mount(&server)
+            .await;
+        let result = exchange_password(
+            &http(),
+            &server_url(&server).await,
+            "ada",
+            &SecretString::from("pw".to_owned()),
+        )
+        .await;
+        assert!(matches!(result, Err(SignInError::TooLarge)));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_key_answer_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/login"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"token": "sess_x", "username": "ada", "role": "user"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/keys"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_bytes(vec![b'x'; MAX_AUTH_BODY_BYTES + 1]),
+            )
+            .mount(&server)
+            .await;
+        let result = exchange_password(
+            &http(),
+            &server_url(&server).await,
+            "ada",
+            &SecretString::from("pw".to_owned()),
+        )
+        .await;
+        assert!(matches!(result, Err(SignInError::TooLarge)));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_rate_limit_answer_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/login"))
+            .respond_with(
+                ResponseTemplate::new(429).set_body_bytes(vec![b'x'; MAX_AUTH_BODY_BYTES + 1]),
+            )
+            .mount(&server)
+            .await;
+        let result = exchange_password(
+            &http(),
+            &server_url(&server).await,
+            "ada",
+            &SecretString::from("pw".to_owned()),
+        )
+        .await;
+        assert!(matches!(result, Err(SignInError::TooLarge)));
     }
 
     #[tokio::test]
