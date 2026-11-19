@@ -21,7 +21,10 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Schema migrations. Entry `n` brings the schema from version `n` to `n + 1`;
 /// the version is kept in `PRAGMA user_version`. Never edit a released entry:
 /// add a new one, and a test that migrates data from the previous version.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_catalog.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_catalog.sql"),
+    include_str!("migrations/0002_dance_cache.sql"),
+];
 
 /// The schema version this build creates and understands.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -372,5 +375,40 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(n, 1, "{table}");
         }
+    }
+
+    /// Step 1 → 2 keeps existing catalog rows and adds the dance cache.
+    #[test]
+    fn migration_1_to_2_keeps_catalog_rows_and_adds_the_dance_cache() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 1).unwrap();
+        conn.execute(
+            "INSERT INTO server (base_url, created_at) VALUES ('https://music.example', 1)",
+            [],
+        )
+        .unwrap();
+        migrate_to(&mut conn, 2).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 2);
+        let servers: i64 = conn
+            .query_row("SELECT count(*) FROM server", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(servers, 1);
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name IN ('dance_lookup', 'dance_tag')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 2);
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 }

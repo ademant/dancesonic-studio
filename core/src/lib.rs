@@ -8,6 +8,7 @@ pub mod account;
 pub mod catalog;
 pub mod connect;
 pub mod connection;
+pub mod dancebrainz;
 pub mod db;
 pub mod dpop;
 pub mod http;
