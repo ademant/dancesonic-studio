@@ -139,6 +139,19 @@ pub fn ensure_server(db: &Database, base_url: &str, now_ms: i64) -> Result<Serve
     })
 }
 
+/// The server with this base URL, if it exists. Unlike [`ensure_server`] it
+/// never creates one.
+pub fn find_server(conn: &Connection, base_url: &str) -> Result<Option<ServerId>, DbError> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM server WHERE base_url = ?1",
+            [base_url],
+            |r| r.get(0),
+        )
+        .optional()?
+        .map(ServerId))
+}
+
 /// The base URL of a server, `None` when it is unknown.
 pub fn server_base_url(conn: &Connection, server: ServerId) -> Result<Option<String>, DbError> {
     Ok(conn
@@ -876,5 +889,22 @@ pub(crate) mod tests {
                 "{sql}\n{p}"
             );
         }
+    }
+    #[test]
+    fn find_server_never_creates_one() {
+        let (_dir, db) = temp_db();
+        assert_eq!(
+            find_server(&db.reader().unwrap(), "https://music.example").unwrap(),
+            None
+        );
+        let created = ensure_server(&db, "https://music.example", 1).unwrap();
+        assert_eq!(
+            find_server(&db.reader().unwrap(), "https://music.example").unwrap(),
+            Some(created)
+        );
+        assert_eq!(
+            find_server(&db.reader().unwrap(), "https://other.example").unwrap(),
+            None
+        );
     }
 }

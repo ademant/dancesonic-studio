@@ -225,6 +225,11 @@ impl PendingPairing {
         &self.code
     }
 
+    /// When the server says the pairing expires, in epoch milliseconds.
+    pub fn expires_at_ms(&self) -> Option<i64> {
+        self.expires_at_ms
+    }
+
     /// The server the pairing is with.
     pub fn server(&self) -> &ServerUrl {
         &self.server
