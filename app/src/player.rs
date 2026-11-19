@@ -83,6 +83,21 @@ impl Inner {
             .map_err(|_| PlayerError::Engine("the stream address".to_owned()))
     }
 
+    /// Keeps the cache downloads of the current and next song only, and
+    /// fetches the next song once the current one is complete (#30).
+    fn cache_ahead(&self) {
+        let Some(proxy) = &self.proxy else { return };
+        let Some(current) = self.queue.current_index() else {
+            return;
+        };
+        let songs = self.queue.songs();
+        let keep: Vec<SongId> = songs.iter().skip(current).take(2).cloned().collect();
+        proxy.retain(&keep);
+        if let Some(next) = keep.get(1) {
+            proxy.prefetch(next);
+        }
+    }
+
     /// The URI of the song after the current one, or nothing at the end.
     fn next_uri(&self) -> Option<String> {
         let next = self.queue.current_index()? + 1;
@@ -238,6 +253,7 @@ impl Player {
         self.playbin.set_property("uri", &uri);
         apply_replay_gain(&self.playbin, &self.inner.borrow(), index);
         set_prepared(&self.prepared_next, self.inner.borrow().next_uri());
+        self.inner.borrow().cache_ahead();
         self.playbin
             .set_state(gst::State::Playing)
             .map_err(|err| PlayerError::Engine(err.to_string()))?;
@@ -351,6 +367,7 @@ fn on_gapless_switch(
         let index = state.queue.current_index().unwrap_or(0);
         apply_replay_gain(playbin, &state, index);
         set_prepared(prepared, state.next_uri());
+        state.cache_ahead();
         (index, state.on_event.clone())
     };
     emit(PlayerEvent::TrackChanged(index));

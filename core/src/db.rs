@@ -24,6 +24,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_catalog.sql"),
     include_str!("migrations/0002_dance_cache.sql"),
+    include_str!("migrations/0003_audio_cache.sql"),
 ];
 
 /// The schema version this build creates and understands.
@@ -375,6 +376,65 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(n, 1, "{table}");
         }
+    }
+
+    /// Step 2 → 3 keeps catalog and dance rows and adds the audio cache index,
+    /// whose rows go with their server.
+    #[test]
+    fn migration_2_to_3_keeps_rows_and_adds_the_audio_cache() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO server (id, base_url, created_at) VALUES (1, 'https://music.example', 1);
+             INSERT INTO song (server_id, id, title, size_bytes, synced_at)
+                 VALUES (1, 'so-1', 'Tango', 1000, 1);
+             INSERT INTO dance_lookup (mbid, fetched_at)
+                 VALUES ('00000000-0000-0000-0000-000000000001', 1);",
+        )
+        .unwrap();
+        migrate_to(&mut conn, 3).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 3);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM song) + (SELECT count(*) FROM dance_lookup)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 2);
+
+        let file = format!("{}.audio", "a".repeat(64));
+        conn.execute(
+            "INSERT INTO audio_cache
+                 (server_id, song_id, file_name, size_bytes, content_type, cached_at, played_at)
+                 VALUES (1, 'so-1', ?1, 1000, 'audio/ogg', 2, 2)",
+            [&file],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO audio_cache
+                     (server_id, song_id, file_name, size_bytes, content_type, cached_at, played_at)
+                     VALUES (1, 'so-2', '../escape', 1000, 'audio/ogg', 2, 2)",
+                [],
+            )
+            .is_err(),
+            "a file name that is not a digest is refused"
+        );
+        conn.execute("DELETE FROM server", []).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM audio_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "cache rows go with their server");
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     /// Step 1 → 2 keeps existing catalog rows and adds the dance cache.

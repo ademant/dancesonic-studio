@@ -11,8 +11,21 @@
 //! the proxy. It is compared in constant time, and the URL that carries it is
 //! never logged. Requests are limited in size and time, and the proxy answers
 //! one request per connection.
+//!
+//! With an [`AudioCache`] (#30), the proxy also keeps whole tracks on disk, so
+//! seeks and rate changes do not wait for the network. Playback still starts
+//! on the first bytes: the first request reads the download as it arrives.
+//! A request for bytes the download will reach within [`AHEAD_WAIT`] waits for
+//! it; one further ahead goes to the server, and its bytes are written into
+//! the cache too. When the cache cannot be used, requests go to the server as
+//! before.
 
-use std::sync::Arc;
+#[cfg(test)]
+mod cache_tests;
+mod download;
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use base64::Engine;
@@ -20,13 +33,16 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
+use crate::audio_cache::AudioCache;
 use crate::connection::ServerUrl;
+use crate::http::STREAM_IDLE_TIMEOUT;
 use crate::queue::SongId;
 use crate::subsonic::{API_VERSION, Auth, CLIENT_NAME, credential};
+use download::{Download, FALLBACK_CONTENT_TYPE, Phase, Tee};
 
 /// Largest request head read, in bytes. A stream request is a few hundred.
 pub const MAX_HEAD_BYTES: usize = 8 * 1024;
@@ -52,6 +68,21 @@ const RETRY_DELAY: Duration = Duration::from_millis(200);
 /// Most error sources written to the log for one failure.
 const MAX_ERROR_SOURCES: usize = 8;
 
+/// Longest a request waits for the download to reach the bytes it asks for,
+/// when the download is expected to get there in that time.
+pub const AHEAD_WAIT: Duration = Duration::from_secs(2);
+
+/// Bytes ahead of the download that a request always waits for, whatever the
+/// download's speed so far.
+const SMALL_AHEAD: u64 = 256 * 1024;
+
+/// Longest a request waits for the download's answer from the server (length
+/// and type) before it goes to the server itself.
+const HEADERS_WAIT: Duration = Duration::from_secs(10);
+
+/// Bytes read from a cache file at a time.
+const READ_CHUNK: usize = 64 * 1024;
+
 /// Errors from starting the proxy. Carry no token and no address of the server.
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
@@ -71,6 +102,121 @@ struct Upstream {
     server: ServerUrl,
     auth: Auth,
     token: String,
+    cache: Option<Arc<AudioCache>>,
+    downloads: Mutex<Downloads>,
+    runtime: tokio::runtime::Handle,
+}
+
+/// The proxy's downloads. A finished download leaves the map; a failed one
+/// stays, so its song is streamed without the cache instead of retried on
+/// every request.
+#[derive(Default)]
+struct Downloads {
+    known: HashMap<SongId, (Arc<Download>, AbortHandle)>,
+    /// Downloaded once no other download is running.
+    next: Option<SongId>,
+}
+
+impl Downloads {
+    fn busy(&self) -> bool {
+        self.known
+            .values()
+            .any(|(d, _)| matches!(d.state().phase, Phase::Starting | Phase::Running))
+    }
+}
+
+impl Upstream {
+    fn downloads(&self) -> MutexGuard<'_, Downloads> {
+        self.downloads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The download of `song`, started when there is none. `None` without a cache.
+    fn download_for(self: &Arc<Self>, song: &SongId) -> Option<Arc<Download>> {
+        let cache = self.cache.as_ref()?;
+        let mut downloads = self.downloads();
+        if let Some((download, _)) = downloads.known.get(song) {
+            return Some(Arc::clone(download));
+        }
+        Some(self.start_download(&mut downloads, cache, song))
+    }
+
+    fn start_download(
+        self: &Arc<Self>,
+        downloads: &mut Downloads,
+        cache: &Arc<AudioCache>,
+        song: &SongId,
+    ) -> Arc<Download> {
+        let download = Download::new(song.clone(), cache.partial_path(song));
+        let task = self.runtime.spawn(download::run(
+            Arc::clone(&download),
+            Arc::clone(self),
+            Arc::clone(cache),
+        ));
+        downloads
+            .known
+            .insert(song.clone(), (Arc::clone(&download), task.abort_handle()));
+        download
+    }
+
+    /// Downloads `song` once no other download is running.
+    fn prefetch(self: &Arc<Self>, song: &SongId) {
+        let Some(cache) = &self.cache else { return };
+        if cache.complete(song).is_some() {
+            return;
+        }
+        let mut downloads = self.downloads();
+        if downloads.known.contains_key(song) {
+            return;
+        }
+        if downloads.busy() {
+            downloads.next = Some(song.clone());
+        } else {
+            self.start_download(&mut downloads, cache, song);
+        }
+    }
+
+    /// Stops the downloads of songs not in `keep`.
+    fn retain(&self, keep: &[SongId]) {
+        let mut downloads = self.downloads();
+        downloads.known.retain(|song, (_, task)| {
+            let kept = keep.contains(song);
+            if !kept {
+                task.abort();
+            }
+            kept
+        });
+        if downloads
+            .next
+            .as_ref()
+            .is_some_and(|next| !keep.contains(next))
+        {
+            downloads.next = None;
+        }
+    }
+
+    /// Called by a download task when it ends: starts the queued one.
+    fn download_finished(self: &Arc<Self>, song: &SongId) {
+        let Some(cache) = &self.cache else { return };
+        let mut downloads = self.downloads();
+        let complete = downloads
+            .known
+            .get(song)
+            .is_some_and(|(d, _)| d.state().phase == Phase::Complete);
+        if complete {
+            downloads.known.remove(song);
+        }
+        if downloads.busy() {
+            return;
+        }
+        if let Some(next) = downloads.next.take()
+            && cache.complete(&next).is_none()
+            && !downloads.known.contains_key(&next)
+        {
+            self.start_download(&mut downloads, cache, &next);
+        }
+    }
 }
 
 impl std::fmt::Debug for StreamProxy {
@@ -81,16 +227,19 @@ impl std::fmt::Debug for StreamProxy {
     }
 }
 
-/// A running proxy. Dropping it stops the listener and every open stream.
+/// A running proxy. Dropping it stops the listener, every open stream and
+/// every download.
 pub struct StreamProxy {
     port: u16,
     token: String,
     task: JoinHandle<()>,
+    upstream: Arc<Upstream>,
 }
 
 impl Drop for StreamProxy {
     fn drop(&mut self) {
         self.task.abort();
+        self.upstream.retain(&[]);
     }
 }
 
@@ -102,6 +251,28 @@ impl StreamProxy {
         server: ServerUrl,
         auth: Auth,
     ) -> Result<Self, ProxyError> {
+        Self::launch(http, server, auth, None).await
+    }
+
+    /// Starts the proxy with an audio cache for `server` (#30).
+    pub async fn start_with_cache(
+        http: reqwest::Client,
+        server: ServerUrl,
+        auth: Auth,
+        cache: Arc<AudioCache>,
+    ) -> Result<Self, ProxyError> {
+        if cache.server_key() != server.key() {
+            return Err(ProxyError::Address);
+        }
+        Self::launch(http, server, auth, Some(cache)).await
+    }
+
+    async fn launch(
+        http: reqwest::Client,
+        server: ServerUrl,
+        auth: Auth,
+        cache: Option<Arc<AudioCache>>,
+    ) -> Result<Self, ProxyError> {
         let token = random_token()?;
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -112,9 +283,30 @@ impl StreamProxy {
             server,
             auth,
             token: token.clone(),
+            cache,
+            downloads: Mutex::new(Downloads::default()),
+            runtime: tokio::runtime::Handle::current(),
         });
-        let task = tokio::spawn(accept_loop(listener, upstream));
-        Ok(Self { port, token, task })
+        let task = tokio::spawn(accept_loop(listener, Arc::clone(&upstream)));
+        Ok(Self {
+            port,
+            token,
+            task,
+            upstream,
+        })
+    }
+
+    /// Downloads `song` into the cache once no other download is running: the
+    /// next track in the queue. Does nothing without a cache or when the track
+    /// is cached already. Does not block; callable from the GTK main thread.
+    pub fn prefetch(&self, song: &SongId) {
+        self.upstream.prefetch(song);
+    }
+
+    /// Stops the downloads of all songs but `songs`, for example when the
+    /// queue changes. Their partial files are deleted. Does not block.
+    pub fn retain(&self, songs: &[SongId]) {
+        self.upstream.retain(songs);
     }
 
     /// The URL the player opens for one song. It carries the path token, so it
@@ -172,7 +364,11 @@ async fn serve(mut socket: TcpStream, upstream: Arc<Upstream>) {
         Ok(request) => request,
         Err(status) => return respond(&mut socket, status).await,
     };
-    if let Err(error) = relay(&mut socket, &upstream, request).await {
+    let result = match &upstream.cache {
+        Some(cache) => serve_with_cache(&mut socket, &upstream, cache, &request).await,
+        None => relay(&mut socket, &upstream, &request, None).await,
+    };
+    if let Err(error) = result {
         // Never the URL: it carries the path token.
         tracing::debug!(error, "stream relay ended");
     }
@@ -278,44 +474,42 @@ fn is_byte_range(value: &str) -> bool {
         })
 }
 
-/// Sends the request to the server and copies its answer back.
-async fn relay(
-    socket: &mut TcpStream,
+/// Why a request to the server failed before any answer.
+enum SendError {
+    Signing,
+    Unreachable,
+}
+
+/// Sends one signed request for `song` to the server. A request that fails
+/// before any answer is sent once more, with a fresh credential.
+async fn send_upstream(
     upstream: &Upstream,
-    request: Request,
-) -> Result<(), &'static str> {
+    method: reqwest::Method,
+    song: &SongId,
+    range: Option<&str>,
+) -> Result<reqwest::Response, SendError> {
     let mut url = upstream
         .server
         .endpoint("rest/stream.view")
-        .map_err(|_| "server address")?;
+        .map_err(|_| SendError::Unreachable)?;
     url.query_pairs_mut()
-        .append_pair("id", request.song.as_str())
+        .append_pair("id", song.as_str())
         .append_pair("c", CLIENT_NAME)
         .append_pair("v", API_VERSION);
-    let method = if request.head_only {
-        reqwest::Method::HEAD
-    } else {
-        reqwest::Method::GET
-    };
     let mut attempt = 1;
-    let mut answer = loop {
+    loop {
         // A fresh credential per attempt: a DPoP proof must not be sent twice.
-        let (name, value) = match credential(&upstream.auth, method.as_str(), &url) {
-            Ok(credential) => credential,
-            Err(_) => {
-                respond(socket, 500).await;
-                return Err("signing");
-            }
-        };
+        let (name, value) =
+            credential(&upstream.auth, method.as_str(), &url).map_err(|_| SendError::Signing)?;
         let mut outgoing = upstream
             .http
             .request(method.clone(), url.clone())
             .header(name, value);
-        if let Some(range) = &request.range {
+        if let Some(range) = range {
             outgoing = outgoing.header(RANGE, range);
         }
         match outgoing.send().await {
-            Ok(answer) => break answer,
+            Ok(answer) => return Ok(answer),
             Err(error) => {
                 let retry = attempt < STREAM_ATTEMPTS && worth_retrying(&error);
                 tracing::debug!(
@@ -325,14 +519,41 @@ async fn relay(
                     "stream request failed"
                 );
                 if !retry {
-                    respond(socket, 502).await;
-                    return Err("unreachable");
+                    return Err(SendError::Unreachable);
                 }
                 attempt += 1;
                 tokio::time::sleep(RETRY_DELAY).await;
             }
         }
+    }
+}
+
+/// Sends the request to the server and copies its answer back. With `tee`,
+/// a partial answer that starts where the tee does is also written into the
+/// download's file.
+async fn relay(
+    socket: &mut TcpStream,
+    upstream: &Upstream,
+    request: &Request,
+    tee: Option<(Arc<Download>, u64)>,
+) -> Result<(), &'static str> {
+    let method = if request.head_only {
+        reqwest::Method::HEAD
+    } else {
+        reqwest::Method::GET
     };
+    let mut answer =
+        match send_upstream(upstream, method, &request.song, request.range.as_deref()).await {
+            Ok(answer) => answer,
+            Err(SendError::Signing) => {
+                respond(socket, 500).await;
+                return Err("signing");
+            }
+            Err(SendError::Unreachable) => {
+                respond(socket, 502).await;
+                return Err("unreachable");
+            }
+        };
 
     let status = answer.status();
     if !status.is_success() {
@@ -358,15 +579,329 @@ async fn relay(
     if request.head_only {
         return Ok(());
     }
+    let mut tee = match tee {
+        Some((download, start))
+            if status == StatusCode::PARTIAL_CONTENT
+                && content_range_start(answer.headers()) == Some(start) =>
+        {
+            Tee::open(download, start).await
+        }
+        _ => None,
+    };
+    while let Some(chunk) = answer.chunk().await.map_err(|_| "stream interrupted")? {
+        socket
+            .write_all(&chunk)
+            .await
+            .map_err(|_| "client closed")?;
+        let failed = match tee.as_mut() {
+            Some(tee) => tee.write(&chunk).await.is_err(),
+            None => false,
+        };
+        if failed {
+            tee = None;
+        }
+    }
+    // The answer is complete; a failed shutdown changes nothing for the player.
+    let _ = socket.shutdown().await;
+    Ok(())
+}
+
+/// Serves a request with the cache: from the complete file, from the download
+/// as it arrives, or from the server for bytes far ahead of the download.
+async fn serve_with_cache(
+    socket: &mut TcpStream,
+    upstream: &Arc<Upstream>,
+    cache: &Arc<AudioCache>,
+    request: &Request,
+) -> Result<(), &'static str> {
+    let range = match request.range.as_deref().map(ByteRange::parse) {
+        None => None,
+        Some(Some(range)) => Some(range),
+        // Several ranges, or a form the cache does not serve.
+        Some(None) => return relay(socket, upstream, request, None).await,
+    };
+    if let Some(track) = cache.complete(&request.song) {
+        touch(cache, &request.song).await;
+        return serve_file(socket, upstream, request, &track, range).await;
+    }
+    let Some(download) = upstream.download_for(&request.song) else {
+        return relay(socket, upstream, request, None).await;
+    };
+    download
+        .wait_for(HEADERS_WAIT, |s| {
+            s.total.is_some() || s.phase == Phase::Failed
+        })
+        .await;
+    let state = download.state();
+    let total = match (state.phase, state.total) {
+        (Phase::Running | Phase::Complete, Some(total)) => total,
+        // No answer in time, or the track cannot be cached.
+        _ => return relay(socket, upstream, request, None).await,
+    };
+    if state.phase == Phase::Complete
+        && let Some(track) = cache.complete(&request.song)
+    {
+        return serve_file(socket, upstream, request, &track, range).await;
+    }
+    let Some((start, end)) = resolve(range, total) else {
+        return refuse_range(socket, total).await;
+    };
+    let served = Served {
+        start,
+        end,
+        total,
+        partial: range.is_some(),
+        content_type: state
+            .content_type
+            .clone()
+            .unwrap_or_else(|| FALLBACK_CONTENT_TYPE.to_owned()),
+    };
+    if request.head_only {
+        return write_head(socket, &served).await;
+    }
+    let on_disk = |s: &download::State| s.covered_until(start) > start;
+    let ready = on_disk(&state)
+        || (download.arrives_within(start, AHEAD_WAIT, SMALL_AHEAD)
+            && download.wait_for(AHEAD_WAIT, on_disk).await);
+    if ready {
+        follow(socket, upstream, cache, &download, &served).await
+    } else {
+        relay(socket, upstream, request, Some((download, start))).await
+    }
+}
+
+/// What a request gets: bytes `start..=end` of a track of `total` bytes.
+struct Served {
+    start: u64,
+    end: u64,
+    total: u64,
+    partial: bool,
+    content_type: String,
+}
+
+/// Serves a complete track from its file.
+async fn serve_file(
+    socket: &mut TcpStream,
+    upstream: &Upstream,
+    request: &Request,
+    track: &crate::audio_cache::CachedTrack,
+    range: Option<ByteRange>,
+) -> Result<(), &'static str> {
+    let Some((start, end)) = resolve(range, track.size) else {
+        return refuse_range(socket, track.size).await;
+    };
+    // Opened before answering: a file evicted in the meantime falls back to the server.
+    let Ok(mut file) = tokio::fs::File::open(&track.path).await else {
+        return relay(socket, upstream, request, None).await;
+    };
+    let served = Served {
+        start,
+        end,
+        total: track.size,
+        partial: range.is_some(),
+        content_type: track.content_type.clone(),
+    };
+    write_head(socket, &served).await?;
+    if request.head_only {
+        return Ok(());
+    }
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|_| "cache read failed")?;
+    let mut body = file.take(end - start + 1);
+    tokio::io::copy(&mut body, socket)
+        .await
+        .map_err(|_| "client closed")?;
+    let _ = socket.shutdown().await;
+    Ok(())
+}
+
+/// Serves bytes from the download's file as the download writes them. When
+/// the download fails, the rest comes from the server.
+async fn follow(
+    socket: &mut TcpStream,
+    upstream: &Upstream,
+    cache: &AudioCache,
+    download: &Download,
+    served: &Served,
+) -> Result<(), &'static str> {
+    // The partial file, or the complete one if the download just finished.
+    let file = match tokio::fs::File::open(&download.part).await {
+        Ok(file) => Some(file),
+        Err(_) => match cache.complete(&download.song) {
+            Some(track) => tokio::fs::File::open(&track.path).await.ok(),
+            None => None,
+        },
+    };
+    write_head(socket, served).await?;
+    let Some(mut file) = file else {
+        return continue_upstream(socket, upstream, &download.song, served.start, served.end).await;
+    };
+    file.seek(std::io::SeekFrom::Start(served.start))
+        .await
+        .map_err(|_| "cache read failed")?;
+    let mut buf = vec![0u8; READ_CHUNK];
+    let mut pos = served.start;
+    while pos <= served.end {
+        let state = download.state();
+        let available = state.covered_until(pos);
+        if available > pos {
+            let want = (available.min(served.end + 1) - pos).min(READ_CHUNK as u64);
+            let want = usize::try_from(want).unwrap_or(READ_CHUNK);
+            let read = file
+                .read(&mut buf[..want])
+                .await
+                .map_err(|_| "cache read failed")?;
+            if read == 0 {
+                return continue_upstream(socket, upstream, &download.song, pos, served.end).await;
+            }
+            socket
+                .write_all(&buf[..read])
+                .await
+                .map_err(|_| "client closed")?;
+            pos += u64::try_from(read).unwrap_or(u64::MAX);
+            continue;
+        }
+        if state.phase == Phase::Failed {
+            return continue_upstream(socket, upstream, &download.song, pos, served.end).await;
+        }
+        let arrived = download
+            .wait_for(STREAM_IDLE_TIMEOUT, |s| {
+                s.covered_until(pos) > pos || s.phase == Phase::Failed
+            })
+            .await;
+        if !arrived {
+            return Err("download stalled");
+        }
+    }
+    let _ = socket.shutdown().await;
+    Ok(())
+}
+
+/// Sends bytes `pos..=end` from the server, after the head was already sent.
+async fn continue_upstream(
+    socket: &mut TcpStream,
+    upstream: &Upstream,
+    song: &SongId,
+    pos: u64,
+    end: u64,
+) -> Result<(), &'static str> {
+    let range = format!("bytes={pos}-{end}");
+    let mut answer = send_upstream(upstream, reqwest::Method::GET, song, Some(&range))
+        .await
+        .map_err(|_| "unreachable")?;
+    if answer.status() != StatusCode::PARTIAL_CONTENT
+        || content_range_start(answer.headers()) != Some(pos)
+    {
+        return Err("the server cannot continue the track");
+    }
     while let Some(chunk) = answer.chunk().await.map_err(|_| "stream interrupted")? {
         socket
             .write_all(&chunk)
             .await
             .map_err(|_| "client closed")?;
     }
-    // The answer is complete; a failed shutdown changes nothing for the player.
     let _ = socket.shutdown().await;
     Ok(())
+}
+
+/// Records a play of a cached track, for the eviction order.
+async fn touch(cache: &Arc<AudioCache>, song: &SongId) {
+    let cache = Arc::clone(cache);
+    let song = song.clone();
+    match tokio::task::spawn_blocking(move || cache.touch(&song)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::debug!(%error, "could not record a play"),
+        Err(_) => tracing::debug!("the play-recording task failed"),
+    }
+}
+
+async fn write_head(socket: &mut TcpStream, served: &Served) -> Result<(), &'static str> {
+    let status = if served.partial {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let mut head = status_line(status);
+    head.push_str(&format!(
+        "Content-Type: {}\r\nContent-Length: {}\r\n",
+        served.content_type,
+        served.end - served.start + 1
+    ));
+    if served.partial {
+        head.push_str(&format!(
+            "Content-Range: bytes {}-{}/{}\r\n",
+            served.start, served.end, served.total
+        ));
+    }
+    head.push_str("Accept-Ranges: bytes\r\nConnection: close\r\n\r\n");
+    socket
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|_| "client closed")
+}
+
+async fn refuse_range(socket: &mut TcpStream, total: u64) -> Result<(), &'static str> {
+    let head = format!(
+        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    socket
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|_| "client closed")?;
+    let _ = socket.shutdown().await;
+    Ok(())
+}
+
+/// One byte range, as the player asks for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ByteRange {
+    /// `bytes=a-`
+    From(u64),
+    /// `bytes=a-b`
+    Between(u64, u64),
+    /// `bytes=-n`: the last `n` bytes.
+    Last(u64),
+}
+
+impl ByteRange {
+    /// A single range; `None` for several ranges or anything malformed.
+    fn parse(value: &str) -> Option<Self> {
+        let spec = value.strip_prefix("bytes=")?;
+        if spec.contains(',') {
+            return None;
+        }
+        let (first, last) = spec.split_once('-')?;
+        match (first.is_empty(), last.is_empty()) {
+            (false, true) => Some(Self::From(first.parse().ok()?)),
+            (false, false) => {
+                let (from, to) = (first.parse().ok()?, last.parse().ok()?);
+                (from <= to).then_some(Self::Between(from, to))
+            }
+            (true, false) => Some(Self::Last(last.parse().ok()?)),
+            (true, true) => None,
+        }
+    }
+}
+
+/// The first and last byte a request gets from a track of `total` bytes;
+/// `None` when the range lies outside it.
+fn resolve(range: Option<ByteRange>, total: u64) -> Option<(u64, u64)> {
+    let last = total.checked_sub(1)?;
+    match range {
+        None => Some((0, last)),
+        Some(ByteRange::From(from)) => (from <= last).then_some((from, last)),
+        Some(ByteRange::Between(from, to)) => (from <= last).then_some((from, to.min(last))),
+        Some(ByteRange::Last(count)) => (count > 0).then(|| (total - count.min(total), last)),
+    }
+}
+
+/// The first byte of a `Content-Range: bytes a-b/t` header.
+fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(CONTENT_RANGE)?.to_str().ok()?;
+    let (first, _) = value.strip_prefix("bytes ")?.split_once('-')?;
+    first.parse().ok()
 }
 
 /// Headers that may be copied to the player. The content type is limited to
