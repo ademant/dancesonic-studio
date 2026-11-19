@@ -12,15 +12,24 @@ publish.workspace = true
 name = "studio_core"
 
 [dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 rusqlite = { version = "0.43.0", default-features = false, features = ["bundled", "cache"] }
+rustls-pki-types = { version = "1.16.0", features = ["std"] }
 secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync", "macros"] }
 tracing = "0.1.44"
+url = "2.5.8"
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+rcgen = "0.14"
+rustls = "0.23.46"
 tempfile = "3.27.0"
-tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "rt-multi-thread", "net", "io-util"] }
+tokio-rustls = "0.26.6"
+wiremock = "0.6.5"
