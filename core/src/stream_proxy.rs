@@ -813,23 +813,36 @@ mod tests {
         );
     }
 
-    /// The stream client keeps no idle connection, so a later request (a seek)
-    /// cannot land on one the server has closed in the meantime.
+    /// Requests in quick succession (one seek) share a connection, so a seek
+    /// does not open a new one per request. A connection idle longer than
+    /// [`crate::http::STREAM_POOL_IDLE_TIMEOUT`] is not reused, so a later
+    /// request does not land on one the server may have closed.
     #[tokio::test]
-    async fn stream_requests_never_reuse_an_idle_connection() {
+    async fn an_idle_stream_connection_is_reused_only_briefly() {
+        use std::sync::atomic::Ordering;
         let (server, connections, _) = raw_upstream(0).await;
         let key = crate::subsonic::ApiKey::new("tsk_test_key_12345".to_owned()).unwrap();
         let proxy = StreamProxy::start(plain_http(), server, Auth::ApiKey(key))
             .await
             .unwrap();
-        for _ in 0..3 {
+        for _ in 0..2 {
             let answer = ask_for_song(&proxy).await;
             assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
         }
         assert_eq!(
-            connections.load(std::sync::atomic::Ordering::SeqCst),
-            3,
-            "one connection per request, though the server keeps them open"
+            connections.load(Ordering::SeqCst),
+            1,
+            "back-to-back requests share one connection"
+        );
+
+        tokio::time::sleep(crate::http::STREAM_POOL_IDLE_TIMEOUT + Duration::from_millis(500))
+            .await;
+        let answer = ask_for_song(&proxy).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "a connection idle past the timeout is not reused"
         );
     }
 

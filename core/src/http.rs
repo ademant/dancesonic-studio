@@ -58,6 +58,11 @@ fn pinned_certificates(pem: &[u8]) -> Result<Vec<Certificate>, HttpError> {
 /// Longest a stream may go without any bytes arriving.
 pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Longest an idle stream connection is kept for reuse. Below the 5 s after
+/// which Apache closes idle connections by default, so a reused connection is
+/// still open on the server.
+pub const STREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Builds the client for one server.
 pub fn client(settings: &HttpSettings) -> Result<reqwest::Client, HttpError> {
     build(settings, Some(REQUEST_TIMEOUT))
@@ -68,11 +73,12 @@ pub fn client(settings: &HttpSettings) -> Result<reqwest::Client, HttpError> {
 /// off after [`STREAM_IDLE_TIMEOUT`] without data instead. The other rules
 /// are the same as [`client`].
 ///
-/// Idle connections are not kept. A player seeks by opening a new request,
-/// often seconds after the last one, and servers close idle connections
-/// quickly (Apache after 5 s by default). A request sent on such a connection
-/// fails before any answer, and hyper does not retry it once it was written.
-/// A fresh connection per request costs one handshake per seek and avoids that.
+/// Idle connections are kept only for [`STREAM_POOL_IDLE_TIMEOUT`]. A seek
+/// makes several requests in quick succession, and reusing the connection for
+/// them avoids a new handshake each time; a server may limit new connections
+/// per client. A connection idle longer than that may already be closed by the
+/// server: a request sent on it fails before any answer, and hyper does not
+/// retry it once written. The stream proxy retries such a request once.
 pub fn streaming_client(settings: &HttpSettings) -> Result<reqwest::Client, HttpError> {
     build(settings, None)
 }
@@ -91,7 +97,7 @@ fn build(
         Some(timeout) => builder.timeout(timeout),
         None => builder
             .read_timeout(STREAM_IDLE_TIMEOUT)
-            .pool_max_idle_per_host(0),
+            .pool_idle_timeout(STREAM_POOL_IDLE_TIMEOUT),
     };
     if let Some(pem) = &settings.pinned_certificate_pem {
         builder = builder.tls_certs_only(pinned_certificates(pem)?);
