@@ -40,6 +40,18 @@ const TOKEN_BYTES: usize = 24;
 /// Longest `Range` header relayed, in bytes.
 const MAX_RANGE_BYTES: usize = 128;
 
+/// Attempts per stream request. A request that fails before any answer, such
+/// as one on a connection the server has just closed, gets one more attempt
+/// on a fresh connection. That is safe because the proxy only relays `GET` and
+/// `HEAD`, which are idempotent.
+const STREAM_ATTEMPTS: u32 = 2;
+
+/// Pause before the second attempt.
+const RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Most error sources written to the log for one failure.
+const MAX_ERROR_SOURCES: usize = 8;
+
 /// Errors from starting the proxy. Carry no token and no address of the server.
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
@@ -285,23 +297,40 @@ async fn relay(
     } else {
         reqwest::Method::GET
     };
-    let (name, value) = match credential(&upstream.auth, method.as_str(), &url) {
-        Ok(credential) => credential,
-        Err(_) => {
-            respond(socket, 500).await;
-            return Err("signing");
+    let mut attempt = 1;
+    let mut answer = loop {
+        // A fresh credential per attempt: a DPoP proof must not be sent twice.
+        let (name, value) = match credential(&upstream.auth, method.as_str(), &url) {
+            Ok(credential) => credential,
+            Err(_) => {
+                respond(socket, 500).await;
+                return Err("signing");
+            }
+        };
+        let mut outgoing = upstream
+            .http
+            .request(method.clone(), url.clone())
+            .header(name, value);
+        if let Some(range) = &request.range {
+            outgoing = outgoing.header(RANGE, range);
         }
-    };
-    let mut outgoing = upstream.http.request(method, url).header(name, value);
-    if let Some(range) = &request.range {
-        outgoing = outgoing.header(RANGE, range);
-    }
-    let mut answer = match outgoing.send().await {
-        Ok(answer) => answer,
-        Err(error) => {
-            tracing::debug!(error = %error.without_url(), "stream request failed");
-            respond(socket, 502).await;
-            return Err("unreachable");
+        match outgoing.send().await {
+            Ok(answer) => break answer,
+            Err(error) => {
+                let retry = attempt < STREAM_ATTEMPTS && worth_retrying(&error);
+                tracing::debug!(
+                    attempt,
+                    retry,
+                    error = %error_chain(error),
+                    "stream request failed"
+                );
+                if !retry {
+                    respond(socket, 502).await;
+                    return Err("unreachable");
+                }
+                attempt += 1;
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
         }
     };
 
@@ -351,6 +380,29 @@ fn relayable(header: &reqwest::header::HeaderName, value: &str) -> bool {
         return value.starts_with("audio/") || value == "application/octet-stream";
     }
     true
+}
+
+/// Whether a failed request may be sent again. Only failures before any
+/// answer: the connection could not be made, or it closed while the request
+/// was sent. A timeout is not retried; it would only double the wait.
+fn worth_retrying(error: &reqwest::Error) -> bool {
+    !error.is_timeout() && (error.is_connect() || error.is_request())
+}
+
+/// The error and its causes on one line, without the URL: the URL is the
+/// server's stream endpoint and carries the song id. The causes are I/O and
+/// protocol errors, which carry no URL.
+fn error_chain(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    for _ in 0..MAX_ERROR_SOURCES {
+        let Some(cause) = source else { break };
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 fn status_line(status: StatusCode) -> String {
@@ -652,6 +704,133 @@ mod tests {
         )
         .await;
         assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+    }
+
+    /// A minimal upstream server. The first `drop_first` connections are
+    /// closed after the request head is read, without an answer, like a
+    /// connection the server closed just as the request went out. Later
+    /// connections answer every request and stay open (keep-alive).
+    /// Returns the server address, the number of connections accepted and the
+    /// request heads received.
+    async fn raw_upstream(
+        drop_first: usize,
+    ) -> (
+        ServerUrl,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (count, seen) = (Arc::clone(&connections), Arc::clone(&heads));
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let number = count.fetch_add(1, Ordering::SeqCst) + 1;
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    while let Ok(head) = read_head(&mut socket).await {
+                        seen.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&head).into_owned());
+                        if number <= drop_first {
+                            return;
+                        }
+                        let answer = "HTTP/1.1 200 OK\r\nContent-Type: audio/ogg\r\n\
+                                      Content-Length: 2\r\n\r\nok";
+                        if socket.write_all(answer.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let url = ServerUrl::parse(
+            &format!("http://127.0.0.1:{port}"),
+            HttpPolicy::ALLOW_PRIVATE_HTTP,
+        )
+        .unwrap();
+        (url, connections, heads)
+    }
+
+    async fn ask_for_song(proxy: &StreamProxy) -> String {
+        ask(
+            proxy.port(),
+            &format!(
+                "GET /{}/stream?id=so-7 HTTP/1.1\r\nHost: x\r\n\r\n",
+                proxy.token
+            ),
+        )
+        .await
+    }
+
+    /// Regression: a stream request sent on a connection the server closed
+    /// failed with "error sending request", and the player stopped with 502.
+    #[tokio::test]
+    async fn a_request_dropped_before_any_answer_is_sent_again() {
+        let (server, connections, heads) = raw_upstream(1).await;
+        let device = crate::dpop::DeviceKey::generate().unwrap();
+        let proxy = StreamProxy::start(plain_http(), server, Auth::Device(device))
+            .await
+            .unwrap();
+        let answer = ask_for_song(&proxy).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(answer.ends_with("ok"), "{answer}");
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let heads = heads.lock().unwrap();
+        let proof = |head: &str| {
+            head.lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("dpop"))
+                        .map(|(_, value)| value.trim().to_owned())
+                })
+                .unwrap()
+        };
+        assert_ne!(
+            proof(&heads[0]),
+            proof(&heads[1]),
+            "the second attempt carries a fresh proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_keeps_dropping_gets_two_attempts_then_a_bad_gateway() {
+        let (server, connections, _) = raw_upstream(usize::MAX).await;
+        let key = crate::subsonic::ApiKey::new("tsk_test_key_12345".to_owned()).unwrap();
+        let proxy = StreamProxy::start(plain_http(), server, Auth::ApiKey(key))
+            .await
+            .unwrap();
+        let answer = ask_for_song(&proxy).await;
+        assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            STREAM_ATTEMPTS as usize,
+            "the retry is bounded"
+        );
+    }
+
+    /// The stream client keeps no idle connection, so a later request (a seek)
+    /// cannot land on one the server has closed in the meantime.
+    #[tokio::test]
+    async fn stream_requests_never_reuse_an_idle_connection() {
+        let (server, connections, _) = raw_upstream(0).await;
+        let key = crate::subsonic::ApiKey::new("tsk_test_key_12345".to_owned()).unwrap();
+        let proxy = StreamProxy::start(plain_http(), server, Auth::ApiKey(key))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let answer = ask_for_song(&proxy).await;
+            assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        }
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "one connection per request, though the server keeps them open"
+        );
     }
 
     #[tokio::test]

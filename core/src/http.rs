@@ -67,6 +67,12 @@ pub fn client(settings: &HttpSettings) -> Result<reqwest::Client, HttpError> {
 /// answer, so there is no cap on the whole request; a stalled stream is cut
 /// off after [`STREAM_IDLE_TIMEOUT`] without data instead. The other rules
 /// are the same as [`client`].
+///
+/// Idle connections are not kept. A player seeks by opening a new request,
+/// often seconds after the last one, and servers close idle connections
+/// quickly (Apache after 5 s by default). A request sent on such a connection
+/// fails before any answer, and hyper does not retry it once it was written.
+/// A fresh connection per request costs one handshake per seek and avoids that.
 pub fn streaming_client(settings: &HttpSettings) -> Result<reqwest::Client, HttpError> {
     build(settings, None)
 }
@@ -83,7 +89,9 @@ fn build(
         .user_agent(concat!("DanceSonicStudio/", env!("CARGO_PKG_VERSION")));
     builder = match total_timeout {
         Some(timeout) => builder.timeout(timeout),
-        None => builder.read_timeout(STREAM_IDLE_TIMEOUT),
+        None => builder
+            .read_timeout(STREAM_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(0),
     };
     if let Some(pem) = &settings.pinned_certificate_pem {
         builder = builder.tls_certs_only(pinned_certificates(pem)?);
