@@ -15,6 +15,7 @@ use gtk::glib::BoxedAnyObject;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use studio_core::catalog::{Song, letter_of};
+use studio_core::local_library::FolderWatcher;
 use studio_core::plays::PlayCounter;
 use studio_core::queue::SongId;
 use studio_core::tempo::{MAX_RATE, MIN_RATE, Rate};
@@ -23,10 +24,13 @@ use crate::mpris::{Command, Mpris, NowPlaying};
 use crate::player::{Player, PlayerEvent, Track};
 use crate::seek_bar::SeekBar;
 use crate::session::{self, Catalog, Selection, Session};
-use crate::{Banner, Services, connection_dialog};
+use crate::{Banner, Services, connection_dialog, folders_dialog};
 
 /// How often the position is read from the engine.
 const POSITION_TICK: Duration = Duration::from_millis(250);
+
+/// A watched folder is scanned again once its files were quiet this long.
+const FOLDER_QUIET: Duration = Duration::from_secs(2);
 
 /// A sidebar entry. Sections (letters) select nothing.
 struct Node {
@@ -58,6 +62,8 @@ pub(crate) struct Window {
     mpris: Mpris,
     /// Says when the current track has played long enough to report (#31).
     plays: RefCell<PlayCounter>,
+    /// Watches the local music folders (#10).
+    watcher: RefCell<Option<FolderWatcher>>,
 }
 
 struct Sidebar {
@@ -169,9 +175,11 @@ impl Window {
             "view-refresh-symbolic",
             "Update the library from the server",
         );
+        let folders_button = icon_button("folder-music-symbolic", "Music folders on this computer");
         let header = gtk::HeaderBar::new();
         header.pack_start(&connect_button);
         header.pack_start(&sync_button);
+        header.pack_start(&folders_button);
         header.set_title_widget(Some(&search));
         window.set_titlebar(Some(&header));
 
@@ -191,6 +199,7 @@ impl Window {
             queue: RefCell::default(),
             now_playing: Cell::new(None),
             plays: RefCell::default(),
+            watcher: RefCell::default(),
             playing: Cell::new(false),
             rate: Cell::new(Rate::NORMAL),
             request: Cell::new(0),
@@ -211,6 +220,12 @@ impl Window {
         });
         me.start_player();
         me.connect_signals(&connect_button, &sync_button, &search);
+        let weak = Rc::downgrade(&me);
+        folders_button.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.show_folders();
+            }
+        });
         me.show_detail(None);
         me.update_speed_controls();
         me
@@ -437,6 +452,7 @@ impl Window {
     pub(crate) fn set_services(self: &Rc<Self>, services: Services) {
         *self.services.borrow_mut() = Some(services);
         self.open_session();
+        self.watch_folders();
     }
 
     fn open_session(self: &Rc<Self>) {
@@ -464,6 +480,93 @@ impl Window {
         });
     }
 
+    /// The music folders dialog (#10).
+    fn show_folders(self: &Rc<Self>) {
+        let Some(services) = self.services.borrow().clone() else {
+            self.banner
+                .show("Studio is still starting. Try again in a moment.");
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        folders_dialog::present(
+            &self.window,
+            &self.runtime,
+            services.db,
+            Rc::new(move || {
+                if let Some(me) = weak.upgrade() {
+                    me.reload_catalog();
+                    me.watch_folders();
+                }
+            }),
+        );
+    }
+
+    /// Scans the folders once for what changed while Studio was closed, and
+    /// (re)starts watching them.
+    fn watch_folders(self: &Rc<Self>) {
+        let Some(services) = self.services.borrow().clone() else {
+            return;
+        };
+        self.spawn(session::folders(services.db), |me, folders| {
+            let folders = match folders {
+                Ok(folders) => folders,
+                Err(error) => {
+                    tracing::warn!(%error, "the music folders could not be read");
+                    return;
+                }
+            };
+            // The old watcher stops when it is dropped.
+            me.watcher.borrow_mut().take();
+            if folders.is_empty() {
+                return;
+            }
+            let (sender, changes) = async_channel::unbounded::<i64>();
+            match FolderWatcher::start(&folders, FOLDER_QUIET, move |folder| {
+                // The receiver is gone only when the window is.
+                let _ = sender.send_blocking(folder);
+            }) {
+                Ok(watcher) => *me.watcher.borrow_mut() = Some(watcher),
+                Err(error) => {
+                    tracing::warn!(%error, "the music folders cannot be watched");
+                    me.status.set_text(&format!(
+                        "Music folders are not watched for changes: {error}"
+                    ));
+                }
+            }
+            let weak = Rc::downgrade(me);
+            glib::spawn_future_local(async move {
+                while let Ok(folder) = changes.recv().await {
+                    let Some(me) = weak.upgrade() else { break };
+                    me.rescan(Some(folder));
+                }
+            });
+            me.rescan(None);
+        });
+    }
+
+    /// Scans one music folder, or all for `None`, then shows the result.
+    fn rescan(self: &Rc<Self>, folder: Option<i64>) {
+        let Some(services) = self.services.borrow().clone() else {
+            return;
+        };
+        self.spawn(
+            session::rescan(services.db, folder),
+            |me, result| match result {
+                Ok(report) if report.added + report.updated + report.moved + report.removed > 0 => {
+                    me.status.set_text(&format!(
+                        "Music folders: {}",
+                        folders_dialog::scan_text(&report)
+                    ));
+                    me.reload_catalog();
+                }
+                Ok(_) => {}
+                Err(error) => me
+                    .status
+                    .set_text(&format!("The music folders could not be read: {error}")),
+            },
+        );
+    }
+
     fn sync(self: &Rc<Self>) {
         let Some(session) = self.session.borrow().clone() else {
             return;
@@ -481,6 +584,7 @@ impl Window {
             return;
         };
         self.spawn(async move { session.send_plays().await }, |_, ()| {});
+        self.rescan(None);
     }
 
     fn reload_catalog(self: &Rc<Self>) {
@@ -581,6 +685,7 @@ impl Window {
                 song: id,
                 gain_db: song.track_gain,
                 peak: song.track_peak,
+                local: song.local_path.clone(),
             });
             songs.push(song);
         }
@@ -669,6 +774,11 @@ impl Window {
         let Some(session) = self.session.borrow().clone() else {
             return;
         };
+        if !song.on_server {
+            // A local-only track: nothing to ask the server or report to it.
+            self.plays.borrow_mut().stop();
+            return;
+        }
         if let Some(cover) = song.cover_art.clone() {
             let reader = session.clone();
             self.spawn(
@@ -930,7 +1040,9 @@ impl Window {
 
     fn update_add_button(&self) {
         let d = &self.detail;
-        let has = d.song.borrow().is_some() && d.playlist_names.n_items() > 0;
+        // Server playlists can only hold songs the server has.
+        let has =
+            d.song.borrow().as_ref().is_some_and(|s| s.on_server) && d.playlist_names.n_items() > 0;
         d.add_button.set_sensitive(has);
         d.playlist_choice
             .set_sensitive(d.playlist_names.n_items() > 0);
@@ -1170,7 +1282,17 @@ fn lettered(entries: impl Iterator<Item = (String, Rc<Node>)>) -> Vec<Rc<Node>> 
         .collect()
 }
 
-/// Letter → artist → release.
+/// Where a song can be played from (#10).
+fn location(song: &Song) -> &'static str {
+    match (song.on_server, song.local_path.is_some()) {
+        (true, true) => "Both",
+        (true, false) => "Server",
+        (false, _) => "Local",
+    }
+}
+
+/// Letter → artist → release. Artists with tracks only in local folders are
+/// merged by name with the server's, or listed on their own (#10).
 fn library_nodes(catalog: &Catalog) -> Vec<Rc<Node>> {
     let mut by_artist: BTreeMap<&str, Vec<Rc<Node>>> = BTreeMap::new();
     for album in &catalog.albums {
@@ -1187,17 +1309,60 @@ fn library_nodes(catalog: &Catalog) -> Vec<Rc<Node>> {
             children: Vec::new(),
         }));
     }
-    lettered(catalog.artists.iter().map(|artist| {
+    let local_albums = |artist: &studio_core::local_library::LocalArtist| -> Vec<Rc<Node>> {
+        artist
+            .albums
+            .iter()
+            .map(|album| {
+                Rc::new(Node {
+                    title: format!("{album} (local)"),
+                    selection: Some(Selection::LocalAlbum {
+                        artist: artist.name.clone(),
+                        album: album.clone(),
+                    }),
+                    children: Vec::new(),
+                })
+            })
+            .collect()
+    };
+    let mut local: Vec<&studio_core::local_library::LocalArtist> =
+        catalog.local_artists.iter().collect();
+    let server = catalog.artists.iter().map(|artist| {
         let key = artist.sort_name.as_deref().unwrap_or(&artist.name);
+        let mut children = by_artist.remove(artist.id.as_str()).unwrap_or_default();
+        if let Some(found) = local
+            .iter()
+            .position(|l| l.name.to_lowercase() == artist.name.to_lowercase())
+        {
+            children.extend(local_albums(local.remove(found)));
+        }
         (
-            letter_of(key),
+            key.to_lowercase(),
             Rc::new(Node {
                 title: artist.name.clone(),
                 selection: Some(Selection::Artist(artist.id.clone())),
-                children: by_artist.remove(artist.id.as_str()).unwrap_or_default(),
+                children,
             }),
         )
-    }))
+    });
+    let mut entries: Vec<(String, Rc<Node>)> = server.collect();
+    entries.extend(local.into_iter().map(|artist| {
+        (
+            artist.name.to_lowercase(),
+            Rc::new(Node {
+                title: artist.name.clone(),
+                selection: Some(Selection::LocalArtist(artist.name.clone())),
+                children: local_albums(artist),
+            }),
+        )
+    }));
+    // Server and local-only artists share their letters, sorted by name.
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    lettered(
+        entries
+            .into_iter()
+            .map(|(key, node)| (letter_of(&key), node)),
+    )
 }
 
 impl TrackList {
@@ -1252,6 +1417,14 @@ impl TrackList {
             1.0,
             |s| s.duration_ms.map(clock).unwrap_or_default(),
             |a, b| a.duration_ms.cmp(&b.duration_ms),
+        );
+        add_column(
+            &view,
+            "Where",
+            false,
+            0.0,
+            |s| location(s).to_owned(),
+            |a, b| location(a).cmp(location(b)),
         );
 
         let title = gtk::Label::builder()
@@ -1577,6 +1750,57 @@ mod tests {
             Some(Selection::Album("r1".into()))
         );
         assert!(tree[1].children[1].children.is_empty());
+    }
+
+    /// Local-only artists (#10) join a server artist of the same name, or
+    /// get their own entry among the server's.
+    #[test]
+    fn local_artists_are_merged_into_the_library() {
+        use studio_core::local_library::LocalArtist;
+        let catalog = Catalog {
+            artists: vec![
+                Artist {
+                    id: "a1".into(),
+                    name: "Blowzabella".into(),
+                    sort_name: None,
+                    mbid: None,
+                },
+                Artist {
+                    id: "a2".into(),
+                    name: "Bourdon".into(),
+                    sort_name: None,
+                    mbid: None,
+                },
+            ],
+            local_artists: vec![
+                LocalArtist {
+                    name: "blowzabella".into(),
+                    albums: vec!["Demo".into()],
+                },
+                LocalArtist {
+                    name: "Bal Corsé".into(),
+                    albums: vec!["Live".into()],
+                },
+            ],
+            ..Catalog::default()
+        };
+        let tree = library_nodes(&catalog);
+        let b: Vec<&str> = tree[0].children.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(b, ["Bal Corsé", "Blowzabella", "Bourdon"]);
+        assert_eq!(
+            tree[0].children[0].selection,
+            Some(Selection::LocalArtist("Bal Corsé".into()))
+        );
+        let merged = &tree[0].children[1];
+        assert_eq!(merged.selection, Some(Selection::Artist("a1".into())));
+        assert_eq!(merged.children[0].title, "Demo (local)");
+        assert_eq!(
+            merged.children[0].selection,
+            Some(Selection::LocalAlbum {
+                artist: "blowzabella".into(),
+                album: "Demo".into()
+            })
+        );
     }
 }
 
@@ -1906,6 +2130,29 @@ mod ui_check {
         db.write(|tx| studio_core::dancebrainz::store(tx, &answers, now))
             .expect("dances");
 
+        // A music folder (#10): Mazurka (the recording of so-3) on disk, and
+        // a track the server does not have.
+        let music = shots.join("music");
+        let _ = std::fs::remove_dir_all(&music);
+        std::fs::create_dir_all(&music).expect("music");
+        let source = std::env::var("TRACK").expect("TRACK");
+        tag_copy(
+            &source,
+            &music.join("mazurka.opus"),
+            "Mazurka",
+            "x",
+            Some(MBID_B),
+        );
+        tag_copy(
+            &source,
+            &music.join("only.opus"),
+            "Only here",
+            "Zéphyr",
+            None,
+        );
+        let folder = studio_core::local_library::add_folder(&db, &music, now).expect("folder");
+        studio_core::local_library::scan_folder(&db, &folder, now).expect("scan");
+
         gtk::init().expect("gtk");
         let app = gtk::Application::builder()
             .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -2056,8 +2303,76 @@ mod ui_check {
         assert!(window.bar.tempo_mode.is_active());
         assert!(!window.bar.bpm_mode.is_sensitive());
         save(window.window.upcast_ref(), &shots.join("4-no-bpm.png"));
+
+        // Local folders (#10): the same recording is listed once, as both.
+        let session = window.session.borrow().clone().expect("session");
+        let songs = runtime
+            .block_on(session.songs(Selection::Album("al-2".into())))
+            .expect("songs");
+        let mazurka = songs.iter().find(|s| s.id == "so-3").expect("so-3");
+        assert_eq!(location(mazurka), "Both");
+        assert!(songs.iter().all(|s| s.on_server), "no second copy");
+        let letters: Vec<String> = (0..window.sidebar.library.n_items())
+            .filter_map(|i| {
+                window
+                    .sidebar
+                    .library
+                    .item(i)
+                    .and_downcast::<BoxedAnyObject>()
+            })
+            .map(|o| o.borrow::<Rc<Node>>().title.clone())
+            .collect();
+        assert!(letters.contains(&"Z".to_owned()), "{letters:?}");
+        window.show_songs("Zéphyr".into(), Selection::LocalArtist("Zéphyr".into()));
+        pump(800);
+        assert_eq!(window.tracks.sorted.n_items(), 1);
+        window.play_list(0);
+        pump(2500);
+        assert_eq!(window.now_playing.get(), Some(0));
+        let local = window.current_song().expect("song");
+        assert_eq!(location(&local), "Local");
+        let at = window
+            .player
+            .borrow()
+            .as_ref()
+            .and_then(Player::position_ms);
+        assert!(at.is_some_and(|(p, _)| p > 500), "plays from disk: {at:?}");
+        let scrobbles = SCROBBLES.lock().expect("scrobbles").clone();
+        assert!(
+            !scrobbles.iter().any(|t| t.contains("local")),
+            "a local-only track is not reported: {scrobbles:?}"
+        );
+        save(window.window.upcast_ref(), &shots.join("5-local.png"));
         window.window.destroy();
         pump(300);
+    }
+
+    /// Copies an audio file and gives it a title, artist and recording MBID.
+    fn tag_copy(
+        source: &str,
+        target: &std::path::Path,
+        title: &str,
+        artist: &str,
+        mbid: Option<&str>,
+    ) {
+        use lofty::config::WriteOptions;
+        use lofty::file::TaggedFileExt;
+        use lofty::tag::{Accessor, ItemKey, TagExt};
+        std::fs::copy(source, target).expect("copy");
+        let file = lofty::read_from_path(target).expect("read");
+        let mut tag = file
+            .primary_tag()
+            .cloned()
+            .unwrap_or_else(|| lofty::tag::Tag::new(file.primary_tag_type()));
+        tag.set_title(title.into());
+        tag.set_artist(artist.into());
+        tag.set_album("Démo".into());
+        tag.remove_key(ItemKey::AlbumArtist);
+        if let Some(mbid) = mbid {
+            tag.insert_text(ItemKey::MusicBrainzRecordingId, mbid.into());
+        }
+        tag.save_to_path(target, WriteOptions::default())
+            .expect("tag");
     }
 
     impl Window {

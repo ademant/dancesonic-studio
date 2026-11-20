@@ -12,6 +12,7 @@ use studio_core::dancebrainz::{self, Dance, DanceBrainz, Mbid};
 use studio_core::db::Database;
 use studio_core::http::{self, HttpSettings};
 use studio_core::library_feed::LibrarySource;
+use studio_core::local_library::{self, LocalArtist, LocalFilter, LocalFolder, ScanReport};
 use studio_core::plays::{self, Play};
 use studio_core::queue::SongId;
 use studio_core::server_extras::{ANALYSIS_EXTENSION, Waveform};
@@ -44,13 +45,22 @@ pub(crate) struct Catalog {
     pub(crate) albums: Vec<Album>,
     pub(crate) dances: Vec<Dance>,
     pub(crate) playlists: Vec<(String, String)>,
+    /// Artists with tracks only in local folders (#10).
+    pub(crate) local_artists: Vec<LocalArtist>,
 }
 
 /// What the sidebar selected; the track list shows its songs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Selection {
+    /// A server artist; its local-only tracks under the same name come too.
     Artist(String),
     Album(String),
+    /// An artist with tracks only in local folders.
+    LocalArtist(String),
+    LocalAlbum {
+        artist: String,
+        album: String,
+    },
     Dance(i64),
     Playlist(String),
     Search(String),
@@ -234,6 +244,8 @@ impl Session {
                 albums: catalog::albums(&conn, server)?,
                 dances: dancebrainz::dances(&conn, server)?,
                 playlists: catalog::playlists(&conn, server)?,
+                local_artists: local_library::local_artists(&conn, Some(server))
+                    .map_err(|e| studio_core::db::DbError::Invalid(e.to_string()))?,
             })
         })
         .await
@@ -246,18 +258,49 @@ impl Session {
         let db = Arc::clone(&self.db);
         let server = self.server;
         tokio::task::spawn_blocking(move || {
-            let conn = db.reader()?;
-            match &selection {
-                Selection::Artist(id) => catalog::songs_of_artist(&conn, server, id),
-                Selection::Album(id) => catalog::songs_of_album(&conn, server, id),
-                Selection::Dance(tag) => dancebrainz::songs_of_dance(&conn, server, *tag),
-                Selection::Playlist(id) => catalog::playlist_songs(&conn, server, id),
-                Selection::Search(text) => catalog::search_songs(&conn, server, text, SEARCH_LIMIT),
-            }
+            let conn = db.reader().map_err(|e| e.to_string())?;
+            let local = |filter: LocalFilter| {
+                local_library::local_only_songs(&conn, Some(server), &filter, SEARCH_LIMIT)
+                    .map_err(|e| e.to_string())
+            };
+            let mut songs = match &selection {
+                Selection::Artist(id) => {
+                    let mut songs =
+                        catalog::songs_of_artist(&conn, server, id).map_err(|e| e.to_string())?;
+                    if let Some(name) =
+                        catalog::artist_name(&conn, server, id).map_err(|e| e.to_string())?
+                    {
+                        songs.extend(local(LocalFilter::Artist(name))?);
+                    }
+                    songs
+                }
+                Selection::Album(id) => {
+                    catalog::songs_of_album(&conn, server, id).map_err(|e| e.to_string())?
+                }
+                Selection::LocalArtist(name) => local(LocalFilter::Artist(name.clone()))?,
+                Selection::LocalAlbum { artist, album } => local(LocalFilter::Album {
+                    artist: artist.clone(),
+                    album: album.clone(),
+                })?,
+                Selection::Dance(tag) => {
+                    dancebrainz::songs_of_dance(&conn, server, *tag).map_err(|e| e.to_string())?
+                }
+                Selection::Playlist(id) => {
+                    catalog::playlist_songs(&conn, server, id).map_err(|e| e.to_string())?
+                }
+                Selection::Search(text) => {
+                    let mut songs = catalog::search_songs(&conn, server, text, SEARCH_LIMIT)
+                        .map_err(|e| e.to_string())?;
+                    songs.extend(local(LocalFilter::Search(text.clone()))?);
+                    songs
+                }
+            };
+            // Every song with a local file plays from disk (#10).
+            local_library::resolve_paths(&conn, &mut songs).map_err(|e| e.to_string())?;
+            Ok(songs)
         })
         .await
         .map_err(|_| "The library task stopped.".to_owned())?
-        .map_err(|e| e.to_string())
     }
 
     /// The dance names of a recording, from the cache.
@@ -348,6 +391,64 @@ impl Session {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+/// The local folders (#10).
+pub(crate) async fn folders(db: Arc<Database>) -> Result<Vec<LocalFolder>, String> {
+    tokio::task::spawn_blocking(move || {
+        let conn = db.reader().map_err(|e| e.to_string())?;
+        local_library::folders(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "The library task stopped.".to_owned())?
+}
+
+/// Adds a folder and scans it.
+pub(crate) async fn add_folder(
+    db: Arc<Database>,
+    path: std::path::PathBuf,
+) -> Result<ScanReport, String> {
+    tokio::task::spawn_blocking(move || {
+        let now = sync::now_ms();
+        let folder = local_library::add_folder(&db, &path, now).map_err(|e| e.to_string())?;
+        local_library::scan_folder(&db, &folder, now).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "The scan stopped.".to_owned())?
+}
+
+/// Forgets a folder; its files stay on disk.
+pub(crate) async fn remove_folder(db: Arc<Database>, folder: i64) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        local_library::remove_folder(&db, folder).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "The library task stopped.".to_owned())?
+}
+
+/// Scans one folder again, or all of them for `None`.
+pub(crate) async fn rescan(db: Arc<Database>, folder: Option<i64>) -> Result<ScanReport, String> {
+    tokio::task::spawn_blocking(move || {
+        let folders = local_library::folders(&db.reader().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let mut total = ScanReport::default();
+        for f in folders
+            .iter()
+            .filter(|f| folder.is_none_or(|id| id == f.id))
+        {
+            let report =
+                local_library::scan_folder(&db, f, sync::now_ms()).map_err(|e| e.to_string())?;
+            total.added += report.added;
+            total.updated += report.updated;
+            total.moved += report.moved;
+            total.removed += report.removed;
+            total.unchanged += report.unchanged;
+            total.unreadable += report.unreadable;
+        }
+        Ok(total)
+    })
+    .await
+    .map_err(|_| "The scan stopped.".to_owned())?
 }
 
 /// The DanceBrainz client, read anonymously over https.

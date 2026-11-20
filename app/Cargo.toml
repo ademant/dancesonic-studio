@@ -26,4 +26,5 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 workspace = true
 
 [dev-dependencies]
+lofty = "0.25.5"
 tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "macros"] }
