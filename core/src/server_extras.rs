@@ -153,9 +153,87 @@ impl SubsonicClient {
     }
 }
 
+/// Writes cover bytes to `dir` for the desktop's media controls (#7), which
+/// need a file to show. The name is a hash of the server and cover id, so a
+/// server value never becomes part of a path. The directory is private
+/// (`0700`), the file `0600`, written to a temporary name and renamed. An
+/// existing file is reused.
+pub fn store_cover(
+    dir: &std::path::Path,
+    server_key: &str,
+    cover_id: &str,
+    bytes: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::other("the cover directory is a symlink"));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let mut hash = Sha256::new();
+    hash.update(server_key.as_bytes());
+    hash.update([0]);
+    hash.update(cover_id.as_bytes());
+    let name: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(format!("{name}.img"));
+    if path.is_file() {
+        return Ok(path);
+    }
+    let temp = dir.join(format!("{name}.{}.part", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temp, &path)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn covers_are_stored_privately_under_a_hashed_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("covers");
+        let path = store_cover(&dir, "https://a.example", "../../etc/passwd", b"img").unwrap();
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name.len(), 64 + 4);
+        assert!(name.chars().take(64).all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"img");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+        // Same server and cover: the same file. Another server: another file.
+        assert_eq!(
+            store_cover(&dir, "https://a.example", "../../etc/passwd", b"x").unwrap(),
+            path
+        );
+        assert_ne!(
+            store_cover(&dir, "https://b.example", "../../etc/passwd", b"x").unwrap(),
+            path
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "no temporary files left"
+        );
+    }
     use crate::connection::{HttpPolicy, ServerUrl};
     use crate::http::{HttpSettings, client};
     use crate::subsonic::{ApiKey, Auth};

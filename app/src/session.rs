@@ -257,6 +257,30 @@ impl Session {
         }
     }
 
+    /// A `file://` URL of the cover, stored privately for the desktop's
+    /// media controls (#7).
+    pub(crate) async fn cover_file(&self, cover_id: String) -> Option<String> {
+        let bytes = self.cover(cover_id.clone()).await?;
+        let dir = gtk::glib::user_cache_dir()
+            .join("dancesonic-studio")
+            .join("covers");
+        let server = self.client.server().key();
+        let stored = tokio::task::spawn_blocking(move || {
+            studio_core::server_extras::store_cover(&dir, &server, &cover_id, &bytes)
+        })
+        .await;
+        match stored {
+            Ok(Ok(path)) => gtk::glib::filename_to_uri(&path, None)
+                .ok()
+                .map(|uri| uri.to_string()),
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "cover not stored");
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
     /// Adds a song to a playlist on the server, then syncs so the local
     /// playlist matches.
     pub(crate) async fn add_to_playlist(

@@ -69,6 +69,8 @@ struct Inner {
     /// The rate still has to be applied: a seek is refused while the pipeline
     /// changes state, so it waits for the next async-done.
     rate_pending: bool,
+    /// The user's volume, 0 to 1, applied on top of ReplayGain.
+    volume: f64,
     /// The user paused. Buffering must not resume a pause the user asked for.
     user_paused: bool,
     on_event: Rc<dyn Fn(PlayerEvent)>,
@@ -142,6 +144,7 @@ impl Player {
             feeds: Feeds::default(),
             rate: Rate::NORMAL,
             rate_pending: false,
+            volume: 1.0,
             user_paused: false,
             on_event: Rc::new(on_event),
         }));
@@ -355,6 +358,24 @@ impl Player {
         Some((position.mseconds(), duration))
     }
 
+    /// The user's volume, 0 to 1.
+    pub(crate) fn volume(&self) -> f64 {
+        self.inner.borrow().volume
+    }
+
+    /// Sets the user's volume, 0 to 1. ReplayGain still applies on top.
+    pub(crate) fn set_volume(&self, volume: f64) {
+        let volume = if volume.is_finite() {
+            volume.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let mut inner = self.inner.borrow_mut();
+        inner.volume = volume;
+        let index = inner.queue.current_index().unwrap_or(0);
+        apply_replay_gain(&self.playbin, &inner, index);
+    }
+
     /// Changes the speed from here on. The pitch stays the same (`scaletempo`).
     pub(crate) fn set_rate(&mut self, rate: Rate) -> Result<(), PlayerError> {
         self.inner.borrow_mut().rate = rate;
@@ -404,11 +425,13 @@ fn on_gapless_switch(
     emit(PlayerEvent::TrackChanged(index));
 }
 
+/// Sets the pipeline volume: the track's ReplayGain times the user's volume.
 fn apply_replay_gain(playbin: &gst::Element, inner: &Inner, index: usize) {
-    let Some(track) = inner.tracks.get(index) else {
-        return;
-    };
-    playbin.set_property("volume", replay_volume(track.gain_db, track.peak));
+    let gain = inner
+        .tracks
+        .get(index)
+        .map_or(1.0, |t| replay_volume(t.gain_db, t.peak));
+    playbin.set_property("volume", gain * inner.volume);
 }
 
 /// Seeks to `position_ms` at `rate`. The event goes to the audio sink, not to

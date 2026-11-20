@@ -18,6 +18,7 @@ use studio_core::catalog::{Song, letter_of};
 use studio_core::queue::SongId;
 use studio_core::tempo::{MAX_RATE, MIN_RATE, Rate};
 
+use crate::mpris::{Command, Mpris, NowPlaying};
 use crate::player::{Player, PlayerEvent, Track};
 use crate::seek_bar::SeekBar;
 use crate::session::{self, Catalog, Selection, Session};
@@ -52,6 +53,8 @@ pub(crate) struct Window {
     rate: Cell<Rate>,
     /// Bumped on every new selection, so a late answer for an old one is dropped.
     request: Cell<u64>,
+    /// The desktop's media controls (#7).
+    mpris: Mpris,
 }
 
 struct Sidebar {
@@ -169,6 +172,7 @@ impl Window {
         header.set_title_widget(Some(&search));
         window.set_titlebar(Some(&header));
 
+        let (mpris, commands) = Mpris::start(runtime);
         let me = Rc::new(Self {
             window,
             runtime: Arc::clone(runtime),
@@ -186,6 +190,14 @@ impl Window {
             playing: Cell::new(false),
             rate: Cell::new(Rate::NORMAL),
             request: Cell::new(0),
+            mpris,
+        });
+        let weak = Rc::downgrade(&me);
+        glib::spawn_future_local(async move {
+            while let Ok(command) = commands.recv().await {
+                let Some(me) = weak.upgrade() else { break };
+                me.on_command(command);
+            }
         });
         // Every handler holds the state weakly; the window holds it strongly
         // until it is destroyed, which also ends playback.
@@ -369,7 +381,7 @@ impl Window {
         let weak = Rc::downgrade(self);
         bar.seek.connect_seek(move |target| {
             if let Some(me) = weak.upgrade() {
-                me.with_player(|p| p.seek_to(target));
+                me.seek(target);
             }
         });
         let weak = Rc::downgrade(self);
@@ -602,6 +614,7 @@ impl Window {
                 self.playing.set(false);
                 self.now_playing.set(None);
                 self.bar.now.set_text("");
+                self.mpris.set_track(None, false, false);
             }
             PlayerEvent::Failed(message) => {
                 self.status.set_text(&format!("Playback failed: {message}"));
@@ -631,9 +644,33 @@ impl Window {
         if self.detail.song.borrow().is_none() {
             self.show_detail(Some(song.clone()));
         }
+        let index = self.now_playing.get().unwrap_or(0);
+        let now = NowPlaying {
+            index,
+            title: song.title.clone(),
+            artist: song.artist_name.clone(),
+            album: song.album_name.clone(),
+            length_ms: song.duration_ms,
+            art_url: None,
+        };
+        let has_next = index + 1 < self.queue.borrow().len();
+        // Previous always works: on the first track it restarts it.
+        self.mpris.set_track(Some(now.clone()), true, has_next);
         let Some(session) = self.session.borrow().clone() else {
             return;
         };
+        if let Some(cover) = song.cover_art.clone() {
+            let reader = session.clone();
+            self.spawn(
+                async move { reader.cover_file(cover).await },
+                move |me, art_url| {
+                    if art_url.is_some() && me.now_playing.get() == Some(index) {
+                        let now = NowPlaying { art_url, ..now };
+                        me.mpris.set_track(Some(now), true, has_next);
+                    }
+                },
+            );
+        }
         let Ok(id) = SongId::parse(&song.id) else {
             return;
         };
@@ -661,6 +698,7 @@ impl Window {
             .or_else(|| self.current_song().and_then(|s| s.duration_ms))
             .unwrap_or(0);
         if self.now_playing.get().is_some() {
+            self.mpris.set_position(position);
             self.bar.seek.set_position(position, length);
             self.bar
                 .time
@@ -681,7 +719,64 @@ impl Window {
         let rate = Rate::new(factor.clamp(MIN_RATE, MAX_RATE)).unwrap_or(Rate::NORMAL);
         self.rate.set(rate);
         self.with_player(|p| p.set_rate(rate));
+        self.mpris.set_rate(rate.factor());
         self.update_speed_controls();
+    }
+
+    /// Seeks in the current track and tells the media controls.
+    fn seek(&self, target_ms: u64) {
+        self.with_player(|p| p.seek_to(target_ms));
+        self.mpris.seeked(target_ms);
+    }
+
+    /// A command from the desktop's media controls.
+    fn on_command(self: &Rc<Self>, command: Command) {
+        tracing::debug!(?command, "media control");
+        match command {
+            Command::Play if !self.playing.get() => self.toggle_play(),
+            Command::Pause if self.playing.get() => self.toggle_play(),
+            Command::Play | Command::Pause => {}
+            Command::PlayPause => self.toggle_play(),
+            Command::Stop => {
+                if let Some(player) = self.player.borrow().as_ref() {
+                    player.stop();
+                }
+                self.playing.set(false);
+                self.now_playing.set(None);
+                self.bar.now.set_text("");
+                self.mpris.set_track(None, false, false);
+                self.update_play_button();
+            }
+            Command::Next => self.with_player(|p| p.next()),
+            Command::Previous => self.with_player(|p| p.previous()),
+            Command::SeekBy(offset) => {
+                let position = self.player.borrow().as_ref().and_then(Player::position_ms);
+                let Some((position, length)) = position else {
+                    return;
+                };
+                let target = position.saturating_add_signed(offset);
+                // The spec: seeking past the end goes to the next track.
+                if length.is_some_and(|l| target >= l) {
+                    self.with_player(|p| p.next());
+                } else {
+                    self.seek(target);
+                }
+            }
+            Command::SetPosition { index, position_ms } => {
+                if self.now_playing.get() == Some(index) {
+                    self.seek(position_ms);
+                }
+            }
+            Command::SetRate(rate) => self.set_rate(rate),
+            Command::SetVolume(volume) => {
+                if let Some(player) = self.player.borrow().as_ref() {
+                    player.set_volume(volume);
+                    self.mpris.set_volume(player.volume());
+                }
+            }
+            Command::Raise => self.window.present(),
+            Command::Quit => self.window.close(),
+        }
     }
 
     /// Puts the speed slider, its label and the mode switch in line with the
@@ -723,6 +818,8 @@ impl Window {
         } else {
             ("media-playback-start-symbolic", "Play")
         };
+        self.mpris
+            .set_playing(self.now_playing.get().map(|_| self.playing.get()));
         self.bar.play.set_icon_name(icon);
         self.bar.play.set_tooltip_text(Some(label));
         self.bar
@@ -1663,6 +1760,57 @@ mod ui_check {
         eprintln!("SHOT {}", path.display());
     }
 
+    const MPRIS: [&str; 6] = [
+        "--session",
+        "--dest",
+        "org.mpris.MediaPlayer2.DanceSonicStudio",
+        "--object-path",
+        "/org/mpris/MediaPlayer2",
+        "--method",
+    ];
+
+    fn gdbus(args: &[&str]) -> String {
+        let out = std::process::Command::new("gdbus")
+            .arg("call")
+            .args(MPRIS)
+            .args(args)
+            .output()
+            .expect("gdbus");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn mpris_get(property: &str) -> String {
+        gdbus(&[
+            "org.freedesktop.DBus.Properties.Get",
+            "org.mpris.MediaPlayer2.Player",
+            property,
+        ])
+    }
+
+    fn mpris_set(property: &str, value: &str) {
+        let value = format!("<{value}>");
+        gdbus(&[
+            "org.freedesktop.DBus.Properties.Set",
+            "org.mpris.MediaPlayer2.Player",
+            property,
+            &value,
+        ]);
+    }
+
+    /// Calls a method of the Player interface. gdbus would block the main
+    /// loop that answers it only for the window; the server runs on Tokio.
+    fn mpris_call(method: &str, args: &[&str]) {
+        let method = format!("org.mpris.MediaPlayer2.Player.{method}");
+        let mut all = vec![method.as_str()];
+        all.extend_from_slice(args);
+        gdbus(&all);
+    }
+
     fn pump(millis: u64) {
         let context = glib::MainContext::default();
         let end = std::time::Instant::now() + Duration::from_millis(millis);
@@ -1770,6 +1918,50 @@ mod ui_check {
         let rate = window.rate.get().factor();
         assert!((rate - 140.0 / 132.0).abs() < 0.01, "rate {rate}");
         save(window.window.upcast_ref(), &shots.join("2-playing-bpm.png"));
+
+        // Media controls (#7) over the real session bus.
+        let status = mpris_get("PlaybackStatus");
+        assert!(status.contains("Playing"), "{status}");
+        let meta = mpris_get("Metadata");
+        assert!(meta.contains("An dro Pleiben"), "{meta}");
+        assert!(
+            meta.contains("mpris:artUrl") && meta.contains("file://"),
+            "{meta}"
+        );
+        assert!(meta.contains("/org/dancesonic/Studio/track/0"), "{meta}");
+        mpris_call("PlayPause", &[]);
+        pump(800);
+        assert!(!window.playing.get(), "PlayPause pauses");
+        assert!(mpris_get("PlaybackStatus").contains("Paused"));
+        mpris_call("Play", &[]);
+        pump(800);
+        assert!(window.playing.get(), "Play resumes");
+        mpris_set("Rate", "1.25");
+        pump(800);
+        assert!(
+            (window.rate.get().factor() - 1.25).abs() < 1e-9,
+            "Rate from MPRIS"
+        );
+        mpris_set("Volume", "0.5");
+        pump(500);
+        assert!(mpris_get("Volume").contains("0.5"));
+        mpris_call(
+            "SetPosition",
+            &["/org/dancesonic/Studio/track/0", "60000000"],
+        );
+        pump(1200);
+        let at = window
+            .player
+            .borrow()
+            .as_ref()
+            .and_then(Player::position_ms);
+        assert!(
+            at.is_some_and(|(p, _)| (60_000..63_000).contains(&p)),
+            "{at:?}"
+        );
+        window.bar.bpm_mode.set_active(true);
+        window.bar.speed.set_value(140.0);
+        pump(500);
 
         // Dances view and its songs.
         let stack = window

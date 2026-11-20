@@ -1,6 +1,7 @@
 //! DanceSonic Studio: the GTK4 user interface.
 
 mod connection_dialog;
+mod mpris;
 mod player;
 mod secret_service;
 mod seek_bar;
