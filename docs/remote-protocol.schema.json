@@ -1,0 +1,258 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ademant/dancesonic-studio/docs/remote-protocol.schema.json",
+  "title": "DanceSonic remote control protocol, version 1",
+  "description": "Every message between the phone and Studio. See remote-protocol.md.",
+  "oneOf": [
+    { "$ref": "#/$defs/pair_request" },
+    { "$ref": "#/$defs/hello" },
+    { "$ref": "#/$defs/command" },
+    { "$ref": "#/$defs/identity" },
+    { "$ref": "#/$defs/pair_pending" },
+    { "$ref": "#/$defs/pair_accepted" },
+    { "$ref": "#/$defs/pair_rejected" },
+    { "$ref": "#/$defs/welcome" },
+    { "$ref": "#/$defs/result" },
+    { "$ref": "#/$defs/state" },
+    { "$ref": "#/$defs/network_hint" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/bye" }
+  ],
+  "$defs": {
+    "b64u": { "type": "string", "pattern": "^[A-Za-z0-9_-]*$" },
+    "counter": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "song_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "device": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+
+    "pair_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "v", "name", "device_key", "noise_key", "proof", "sig"],
+      "properties": {
+        "type": { "const": "pair_request" },
+        "v": { "const": 1 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "device_key": { "$ref": "#/$defs/b64u", "description": "65-byte uncompressed SEC1 P-256 point" },
+        "noise_key": { "$ref": "#/$defs/b64u", "description": "32-byte X25519 public key" },
+        "proof": { "$ref": "#/$defs/b64u", "description": "HMAC-SHA256(secret, T)" },
+        "sig": { "$ref": "#/$defs/b64u", "description": "DER ECDSA P-256 signature of T" }
+      }
+    },
+    "hello": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "device", "counter", "sig"],
+      "properties": {
+        "type": { "const": "hello" },
+        "device": { "$ref": "#/$defs/device" },
+        "counter": { "$ref": "#/$defs/counter" },
+        "sig": { "$ref": "#/$defs/b64u" }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "counter", "body", "sig"],
+      "properties": {
+        "type": { "const": "command" },
+        "counter": { "$ref": "#/$defs/counter" },
+        "body": { "type": "string", "maxLength": 32768, "description": "JSON text of a command_body" },
+        "sig": { "$ref": "#/$defs/b64u" }
+      }
+    },
+    "command_body": {
+      "description": "The object inside command.body.",
+      "type": "object",
+      "required": ["cmd"],
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cmd": {
+              "enum": ["play", "pause", "toggle", "stop", "next", "previous", "get_state",
+                       "library_artists", "library_playlists", "library_dances"]
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["position_ms"],
+          "properties": { "cmd": { "const": "seek" }, "position_ms": { "type": "integer", "minimum": 0 } }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["rate"],
+          "properties": { "cmd": { "const": "set_rate" }, "rate": { "type": "number", "minimum": 0.5, "maximum": 1.5 } }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["bpm"],
+          "properties": { "cmd": { "const": "set_bpm" }, "bpm": { "type": "number", "minimum": 20, "maximum": 300 } }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["songs"],
+          "properties": {
+            "cmd": { "const": "play_songs" },
+            "songs": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/$defs/song_id" } },
+            "start": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["songs"],
+          "properties": {
+            "cmd": { "const": "enqueue" },
+            "songs": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/$defs/song_id" } }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["tag_id"],
+          "properties": { "cmd": { "enum": ["play_dance", "next_of_dance"] }, "tag_id": { "type": "integer" } }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["playlist"],
+          "properties": {
+            "cmd": { "const": "play_playlist" },
+            "playlist": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "start": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["artist"],
+          "properties": { "cmd": { "const": "library_albums" }, "artist": { "type": "string", "maxLength": 512 } }
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cmd": { "const": "library_songs" },
+            "album": { "type": "string", "maxLength": 512 },
+            "artist": { "type": "string", "maxLength": 512 },
+            "playlist": { "type": "string", "maxLength": 512 },
+            "dance": { "type": "integer" },
+            "query": { "type": "string", "maxLength": 256 }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["id"],
+          "properties": { "cmd": { "const": "cover" }, "id": { "type": "string", "minLength": 1, "maxLength": 512 } }
+        }
+      ]
+    },
+
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "tls_spki"],
+      "properties": {
+        "type": { "const": "identity" },
+        "tls_spki": { "$ref": "#/$defs/b64u", "description": "DER SubjectPublicKeyInfo of Studio's TLS key" }
+      }
+    },
+    "pair_pending": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": { "type": { "const": "pair_pending" } }
+    },
+    "pair_accepted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "device"],
+      "properties": { "type": { "const": "pair_accepted" }, "device": { "$ref": "#/$defs/device" } }
+    },
+    "pair_rejected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "reason"],
+      "properties": { "type": { "const": "pair_rejected" }, "reason": { "type": "string", "maxLength": 64 } }
+    },
+    "welcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "protocol", "name", "transport", "features"],
+      "properties": {
+        "type": { "const": "welcome" },
+        "protocol": { "const": 1 },
+        "name": { "type": "string", "maxLength": 64 },
+        "transport": { "enum": ["ble", "network"] },
+        "features": {
+          "type": "array",
+          "items": { "enum": ["playback", "tempo", "dance", "queue", "library", "cover", "network_hint"] }
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "ok"],
+      "properties": {
+        "type": { "const": "result" },
+        "id": { "$ref": "#/$defs/counter" },
+        "ok": { "type": "boolean" },
+        "error": { "type": "string", "maxLength": 64 },
+        "data": {}
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "playing", "position_ms", "rate", "queue"],
+      "properties": {
+        "type": { "const": "state" },
+        "playing": { "type": "boolean" },
+        "song": { "oneOf": [{ "$ref": "#/$defs/song_id" }, { "type": "null" }] },
+        "index": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+        "position_ms": { "type": "integer", "minimum": 0 },
+        "length_ms": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+        "rate": { "type": "number" },
+        "bpm": { "oneOf": [{ "type": "number" }, { "type": "null" }] },
+        "queue": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/$defs/song_id" } },
+        "dance": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["tag_id", "name"],
+              "properties": { "tag_id": { "type": "integer" }, "name": { "type": "string" } }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "network_hint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "addresses", "port"],
+      "properties": {
+        "type": { "const": "network_hint" },
+        "addresses": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 64 } },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "code"],
+      "properties": {
+        "type": { "const": "error" },
+        "code": {
+          "enum": ["bad_message", "unknown_type", "not_paired", "revoked", "replay", "bad_signature",
+                   "bad_proof", "expired", "secret_used", "rate_limited", "not_on_transport",
+                   "unknown_song", "failed"]
+        }
+      }
+    },
+    "bye": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "reason"],
+      "properties": { "type": { "const": "bye" }, "reason": { "type": "string", "maxLength": 64 } }
+    }
+  }
+}

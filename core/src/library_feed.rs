@@ -378,6 +378,10 @@ fn song_from(item: SongItem) -> Song {
         size_bytes: item.size,
         suffix: item.suffix.map(bounded),
         cover_art: item.cover_art,
+        on_server: true,
+        local_id: None,
+        local_path: None,
+        kept_offline: false,
     }
 }
 

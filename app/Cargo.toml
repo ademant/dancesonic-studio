@@ -10,12 +10,16 @@ publish.workspace = true
 
 [dependencies]
 async-channel = "2.5"
+futures-util = { version = "0.3.34", default-features = false }
 gstreamer = { version = "0.25.4", default-features = false }
 gstreamer-app = { version = "0.25.2", default-features = false }
 mpris-server = { version = "0.11.0", features = ["tokio"] }
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_22"] }
+bluer = { version = "0.17.4", default-features = false, features = ["bluetoothd"] }
+qrcode = { version = "0.15", default-features = false, features = ["std"] }
 oo7 = { version = "0.7.1", default-features = false, features = ["tokio", "native_crypto"] }
 secrecy = "0.10.3"
+serde_json = "1.0.154"
 studio-core = { path = "../core" }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "sync"] }
@@ -26,4 +30,5 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 workspace = true
 
 [dev-dependencies]
+lofty = "0.25.5"
 tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "macros"] }

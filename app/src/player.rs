@@ -43,6 +43,9 @@ pub(crate) struct Track {
     pub(crate) gain_db: Option<f64>,
     /// Track peak as a linear value, when the library has one.
     pub(crate) peak: Option<f64>,
+    /// A local file of the song (#10), checked to be inside its folder.
+    /// When set, the song plays from disk, without the server.
+    pub(crate) local: Option<std::path::PathBuf>,
 }
 
 /// Errors from starting the engine or changing what plays.
@@ -78,6 +81,11 @@ struct Inner {
 
 impl Inner {
     fn uri_for(&self, index: usize) -> Result<String, PlayerError> {
+        if let Some(path) = self.tracks.get(index).and_then(|t| t.local.as_ref()) {
+            return gst::glib::filename_to_uri(path, None)
+                .map(|uri| uri.to_string())
+                .map_err(|_| PlayerError::Engine("the local file has no valid name".to_owned()));
+        }
         let tracks = self.source.as_ref().ok_or(PlayerError::NoServer)?;
         let song = self
             .queue
@@ -95,10 +103,18 @@ impl Inner {
             return;
         };
         let songs = self.queue.songs();
-        let keep: Vec<SongId> = songs.iter().skip(current).take(2).cloned().collect();
+        // Songs played from disk need no download.
+        let from_server = |index: usize| {
+            self.tracks
+                .get(index)
+                .is_none_or(|t| t.local.is_none())
+                .then(|| songs.get(index).cloned())
+                .flatten()
+        };
+        let keep: Vec<SongId> = (current..current + 2).filter_map(from_server).collect();
         tracks.retain(&keep);
-        if let Some(next) = keep.get(1) {
-            tracks.prefetch(next);
+        if let Some(next) = from_server(current + 1) {
+            tracks.prefetch(&next);
         }
     }
 
@@ -259,6 +275,18 @@ impl Player {
             inner.tracks = tracks;
         }
         self.play_current()
+    }
+
+    /// Adds songs at the end of the queue without interrupting playback.
+    pub(crate) fn append(&mut self, tracks: Vec<Track>) -> Result<(), PlayerError> {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .queue
+            .append(tracks.iter().map(|t| t.song.clone()).collect())?;
+        inner.tracks.extend(tracks);
+        // The song after the current one may be new now.
+        set_prepared(&self.prepared_next, inner.next_uri());
+        Ok(())
     }
 
     /// The queue position of the song that plays.
@@ -626,6 +654,7 @@ mod feed_check {
                 song: SongId::parse(id).expect("id"),
                 gain_db: None,
                 peak: None,
+                local: None,
             })
             .collect();
         player.load(songs, 0).expect("load");

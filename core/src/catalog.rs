@@ -71,6 +71,16 @@ pub struct Song {
     pub size_bytes: Option<u64>,
     pub suffix: Option<String>,
     pub cover_art: Option<String>,
+    /// The server has this song. False for a track that exists only in a
+    /// local folder (#10).
+    pub on_server: bool,
+    /// The local track with the same recording, if any (#10).
+    pub local_id: Option<i64>,
+    /// Its file, checked to be inside its folder; filled in by
+    /// [`crate::local_library::resolve_paths`].
+    pub local_path: Option<std::path::PathBuf>,
+    /// `local_path` is an offline copy of the server's file (#17).
+    pub kept_offline: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -451,6 +461,18 @@ pub fn artists(conn: &Connection, server: ServerId) -> Result<Vec<Artist>, DbErr
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// The name of a server artist.
+pub fn artist_name(
+    conn: &Connection,
+    server: ServerId,
+    artist_id: &str,
+) -> Result<Option<String>, DbError> {
+    Ok(conn
+        .prepare_cached("SELECT name FROM artist WHERE server_id = ?1 AND id = ?2")?
+        .query_row(params![server.0, artist_id], |r| r.get(0))
+        .optional()?)
+}
+
 /// Albums of an artist, oldest first.
 pub fn albums_of_artist(
     conn: &Connection,
@@ -503,7 +525,9 @@ pub fn albums(conn: &Connection, server: ServerId) -> Result<Vec<Album>, DbError
 pub(crate) const SONG_COLUMNS: &str =
     "s.id, s.album_id, s.artist_id, s.title, s.album_name, s.artist_name,
     s.track, s.disc, s.year, s.duration_ms, s.mbid, s.bpm, s.tempo_confidence, s.bars_per_min,
-    s.bar_pulses, s.track_gain, s.track_peak, s.size_bytes, s.suffix, s.cover_art";
+    s.bar_pulses, s.track_gain, s.track_peak, s.size_bytes, s.suffix, s.cover_art,
+    (SELECT t.id FROM local_track t WHERE s.mbid IS NOT NULL AND t.mbid = s.mbid
+     ORDER BY t.id LIMIT 1)";
 
 pub(crate) fn song_from_row(r: &Row<'_>) -> rusqlite::Result<Song> {
     Ok(Song {
@@ -531,6 +555,10 @@ pub(crate) fn song_from_row(r: &Row<'_>) -> rusqlite::Result<Song> {
             .and_then(|b| u64::try_from(b).ok()),
         suffix: r.get(18)?,
         cover_art: r.get(19)?,
+        on_server: true,
+        local_id: r.get(20)?,
+        local_path: None,
+        kept_offline: false,
     })
 }
 
@@ -547,6 +575,26 @@ pub fn songs_of_album(
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params![server.0, album_id], song_from_row)?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The songs with these IDs, in the order asked; unknown IDs are left out.
+pub fn songs_by_id(
+    conn: &Connection,
+    server: ServerId,
+    ids: &[String],
+) -> Result<Vec<Song>, DbError> {
+    let sql = format!("SELECT {SONG_COLUMNS} FROM song s WHERE s.server_id = ?1 AND s.id = ?2");
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(song) = stmt
+            .query_row(params![server.0, id], song_from_row)
+            .optional()?
+        {
+            out.push(song);
+        }
+    }
+    Ok(out)
 }
 
 /// Songs of a playlist in playlist order. Entries whose song is not in the
@@ -760,7 +808,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn full_set() -> ChangeSet {
+    pub(crate) fn full_set() -> ChangeSet {
         ChangeSet {
             full: true,
             server_time: 1000,

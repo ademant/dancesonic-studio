@@ -26,6 +26,10 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_dance_cache.sql"),
     include_str!("migrations/0003_audio_cache.sql"),
     include_str!("migrations/0004_play_queue.sql"),
+    include_str!("migrations/0005_local_library.sql"),
+    include_str!("migrations/0006_offline.sql"),
+    include_str!("migrations/0007_remote_devices.sql"),
+    include_str!("migrations/0008_remote_settings.sql"),
 ];
 
 /// The schema version this build creates and understands.
@@ -428,6 +432,187 @@ pub(crate) mod tests {
             .query_row("SELECT count(*) FROM audio_cache", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0, "cache rows go with their server");
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    /// Step 5 → 6 keeps the local library and adds offline copies, with the
+    /// default settings row; copy file names can only be hash-shaped.
+    #[test]
+    fn migration_5_to_6_keeps_rows_and_adds_offline_copies() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 5).unwrap();
+        conn.execute_batch(
+            "INSERT INTO local_folder (id, path, added_at) VALUES (1, '/music', 1);",
+        )
+        .unwrap();
+        migrate_to(&mut conn, 6).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 6);
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM local_folder", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
+        let limit: i64 = conn
+            .query_row("SELECT limit_bytes FROM offline_settings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, 10 * 1024 * 1024 * 1024);
+        let insert = |name: &str| {
+            conn.execute(
+                "INSERT INTO offline_track (base_url, song_id, file_name, size_bytes, sha256,
+                     stored_at) VALUES ('https://music.example', ?1, ?1, 1, ?2, 1)",
+                rusqlite::params![name, "0".repeat(64)],
+            )
+        };
+        insert(&format!("{}.audio", "a".repeat(64))).unwrap();
+        assert!(
+            insert("../../etc/passwd").is_err(),
+            "only hash-shaped names"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO offline_settings (id, limit_bytes) VALUES (2, 1)",
+                []
+            )
+            .is_err(),
+            "one settings row"
+        );
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    /// Step 7 → 8 keeps paired phones and adds the remote switches, off.
+    #[test]
+    fn migration_7_to_8_keeps_phones_and_starts_with_remote_control_off() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 7).unwrap();
+        conn.execute(
+            "INSERT INTO remote_device (id, name, device_key, noise_key, last_counter, paired_at)
+             VALUES (?1, 'Phone', ?2, ?3, 4, 1)",
+            rusqlite::params!["a".repeat(32), vec![4u8; 65], vec![1u8; 32]],
+        )
+        .unwrap();
+        migrate_to(&mut conn, 8).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 8);
+        let counter: i64 = conn
+            .query_row("SELECT last_counter FROM remote_device", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(counter, 4);
+        let settings = crate::remote::settings::load(&conn).unwrap();
+        assert!(!settings.network && !settings.bluetooth, "off by default");
+        assert_eq!(settings.port, 47800);
+        assert!(
+            conn.execute("UPDATE remote_settings SET port = 80", [])
+                .is_err(),
+            "no privileged port"
+        );
+        assert!(
+            conn.execute("INSERT INTO remote_settings (id) VALUES (2)", [])
+                .is_err(),
+            "one settings row"
+        );
+    }
+
+    /// Step 6 → 7 keeps offline pins and adds paired phones, which hold
+    /// only well-formed public keys and a counter that never goes negative.
+    #[test]
+    fn migration_6_to_7_keeps_rows_and_adds_remote_devices() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 6).unwrap();
+        conn.execute_batch(
+            "INSERT INTO offline_pin (base_url, kind, item_id, pinned_at)
+                 VALUES ('https://music.example', 'album', 'al-1', 1);",
+        )
+        .unwrap();
+        migrate_to(&mut conn, 7).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 7);
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM offline_pin", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
+        let insert = |id: &str, key_len: usize, noise: u8, counter: i64| {
+            conn.execute(
+                "INSERT INTO remote_device (id, name, device_key, noise_key, last_counter,
+                     paired_at) VALUES (?1, 'Phone', ?2, ?3, ?4, 1)",
+                rusqlite::params![id, vec![4u8; key_len], vec![noise; 32], counter],
+            )
+        };
+        insert(&"a".repeat(32), 65, 1, 0).unwrap();
+        assert!(
+            insert(&"b".repeat(32), 64, 2, 0).is_err(),
+            "SEC1 points only"
+        );
+        assert!(
+            insert(&"c".repeat(32), 65, 1, 0).is_err(),
+            "one phone per Noise key"
+        );
+        assert!(insert(&"d".repeat(32), 65, 3, -1).is_err(), "counter >= 0");
+        assert!(insert("short", 65, 4, 0).is_err(), "id shape");
+    }
+
+    /// Step 4 → 5 keeps queued plays and adds the local library, whose
+    /// tracks go with their folder and never hold a path that leaves it.
+    #[test]
+    fn migration_4_to_5_keeps_rows_and_adds_the_local_library() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO server (id, base_url, created_at) VALUES (1, 'https://music.example', 1);
+             INSERT INTO play_queue (server_id, song_id, played_at) VALUES (1, 'so-1', 5);",
+        )
+        .unwrap();
+        migrate_to(&mut conn, 5).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 5);
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM play_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
+
+        conn.execute(
+            "INSERT INTO local_folder (id, path, added_at) VALUES (1, '/music', 1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO local_folder (path, added_at) VALUES ('relative', 1)",
+                []
+            )
+            .is_err(),
+            "a folder path is absolute"
+        );
+        let print = "0".repeat(64);
+        let insert = |rel: &str| {
+            conn.execute(
+                "INSERT INTO local_track (folder_id, rel_path, size_bytes, modified_ms,
+                     fingerprint, scanned_at) VALUES (1, ?1, 1, 1, ?2, 1)",
+                rusqlite::params![rel, print],
+            )
+        };
+        insert("Artist/track.flac").unwrap();
+        for bad in ["/etc/passwd", "..", "../x", "a/../../x", "a/.."] {
+            assert!(insert(bad).is_err(), "{bad} is refused");
+        }
+        conn.execute("DELETE FROM local_folder", []).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM local_track", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "tracks go with their folder");
         assert!(
             conn.prepare("PRAGMA foreign_key_check")
                 .unwrap()
