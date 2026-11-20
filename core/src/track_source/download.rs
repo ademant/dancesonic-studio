@@ -1,25 +1,22 @@
 //! Whole-track downloads into the audio cache, and which bytes are on disk.
 //!
 //! One download per song writes the track from the start to its partial file.
-//! Requests for bytes further ahead can also write what they fetch into the
-//! same file (see [`Tee`]); every written range is recorded, so a request can
-//! tell which bytes it may read from disk.
+//! A read far ahead of it starts a ranged request that writes into the same
+//! file (see [`Tee`]); every written range is recorded, so a read can tell
+//! which bytes are on disk.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
-use reqwest::header::CONTENT_TYPE;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
+use tokio::task::AbortHandle;
 
-use super::{Upstream, relayable, send_upstream};
+use super::{SMALL_AHEAD, Upstream, audio_content_type, content_range, send};
 use crate::audio_cache::{AudioCache, MAX_TRACK_BYTES};
 use crate::queue::SongId;
-
-/// Content type when the server sends none that may be relayed.
-pub(super) const FALLBACK_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// Where a download is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +39,17 @@ pub(super) struct Download {
     started: Instant,
     state: Mutex<State>,
     changed: watch::Sender<u64>,
+    /// The ranged request for bytes far ahead, if one runs.
+    range: Mutex<Option<RangeFetch>>,
+}
+
+/// A ranged request writing into the partial file.
+#[derive(Debug)]
+struct RangeFetch {
+    start: u64,
+    /// How far it has written.
+    pos: Arc<std::sync::atomic::AtomicU64>,
+    task: AbortHandle,
 }
 
 #[derive(Clone, Debug)]
@@ -96,7 +104,47 @@ impl Download {
                 spans: Vec::new(),
             }),
             changed: watch::Sender::new(0),
+            range: Mutex::new(None),
         })
+    }
+
+    /// Fetches the track from `pos` on into the partial file, unless a ranged
+    /// request already covers `pos` or will soon. Replaces a request that is
+    /// elsewhere: the player has moved on.
+    pub(super) fn fetch_range(self: &Arc<Self>, upstream: &Arc<Upstream>, pos: u64) {
+        use std::sync::atomic::Ordering;
+        let mut range = self.range.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(fetch) = range.as_ref() {
+            let at = fetch.pos.load(Ordering::SeqCst);
+            if !fetch.task.is_finished() && fetch.start <= pos && pos <= at + SMALL_AHEAD {
+                return;
+            }
+            fetch.task.abort();
+        }
+        let progress = Arc::new(std::sync::atomic::AtomicU64::new(pos));
+        let task = upstream.runtime.spawn(fetch_range(
+            Arc::clone(self),
+            Arc::clone(upstream),
+            pos,
+            Arc::clone(&progress),
+        ));
+        *range = Some(RangeFetch {
+            start: pos,
+            pos: progress,
+            task: task.abort_handle(),
+        });
+    }
+
+    /// Stops the ranged request, if any.
+    pub(super) fn stop_range(&self) {
+        if let Some(fetch) = self
+            .range
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            fetch.task.abort();
+        }
     }
 
     pub(super) fn state(&self) -> State {
@@ -172,6 +220,7 @@ struct Finish {
 
 impl Drop for Finish {
     fn drop(&mut self) {
+        self.download.stop_range();
         if self.done {
             return;
         }
@@ -207,7 +256,7 @@ async fn fetch(
     upstream: &Upstream,
     cache: &Arc<AudioCache>,
 ) -> Result<(), &'static str> {
-    let mut answer = send_upstream(upstream, reqwest::Method::GET, &download.song, None)
+    let mut answer = send(upstream, &download.song, None)
         .await
         .map_err(|_| "server unreachable")?;
     if answer.status() != StatusCode::OK {
@@ -217,13 +266,7 @@ async fn fetch(
     if total == 0 || total > MAX_TRACK_BYTES {
         return Err("track too large to cache");
     }
-    let content_type = answer
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| relayable(&CONTENT_TYPE, v))
-        .unwrap_or(FALLBACK_CONTENT_TYPE)
-        .to_owned();
+    let content_type = audio_content_type(answer.headers());
 
     let file = {
         let cache = Arc::clone(cache);
@@ -280,8 +323,41 @@ async fn fetch(
     Ok(())
 }
 
-/// Writes the bytes of a request that went to the server into the partial
-/// file as well, so the download need not be waited for later.
+/// Fetches the track from `start` on into the partial file, until the bytes
+/// ahead are on disk already or the download ends.
+async fn fetch_range(
+    download: Arc<Download>,
+    upstream: Arc<Upstream>,
+    start: u64,
+    progress: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let range = format!("bytes={start}-");
+    let Ok(mut answer) = send(&upstream, &download.song, Some(&range)).await else {
+        return;
+    };
+    if answer.status() != StatusCode::PARTIAL_CONTENT
+        || content_range(answer.headers()).map(|(first, _)| first) != Some(start)
+    {
+        tracing::debug!("the server cannot send a part of the track");
+        return;
+    }
+    let Some(mut tee) = Tee::open(Arc::clone(&download), start).await else {
+        return;
+    };
+    while let Ok(Some(chunk)) = answer.chunk().await {
+        if tee.write(&chunk).await.is_err() {
+            return;
+        }
+        progress.store(tee.pos, std::sync::atomic::Ordering::SeqCst);
+        let state = download.state();
+        // Caught up with bytes already on disk, or the download is over.
+        if state.phase != Phase::Running || state.covered_until(tee.pos) > tee.pos {
+            return;
+        }
+    }
+}
+
+/// Writes the bytes of a ranged request into the partial file.
 pub(super) struct Tee {
     download: Arc<Download>,
     file: tokio::fs::File,

@@ -8,7 +8,7 @@
 //! opens. The cache holds one server's tracks; opening it for another server
 //! clears the rest, because song ids belong to one server.
 //!
-//! The stream proxy fills the cache (see [`crate::stream_proxy`]). All methods
+//! The track source fills the cache (see [`crate::track_source`]). All methods
 //! here block on the file system and the database: call them off the GTK main
 //! thread, and from `spawn_blocking` in async code.
 

@@ -1,14 +1,14 @@
 //! DanceSonic Studio: the GTK4 user interface.
 
 mod connection_dialog;
-#[expect(
-    dead_code,
-    reason = "the window that drives playback is #8; the engine is tested by its use there"
-)]
+mod mpris;
 mod player;
 mod secret_service;
+mod seek_bar;
+mod session;
+mod track_feed;
+mod window;
 
-use std::cell::RefCell;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use gtk::glib;
 use gtk::prelude::*;
+use studio_core::APP_ID;
 use studio_core::db::Database;
 use studio_core::secrets::{Persistence, SecretVault};
-use studio_core::{APP_ID, APP_NAME};
 use tracing_subscriber::EnvFilter;
 
 use crate::secret_service::SecretService;
@@ -48,9 +48,8 @@ fn main() -> glib::ExitCode {
         }
     };
 
-    let services: Rc<RefCell<Option<Services>>> = Rc::default();
     let app = gtk::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(move |app| activate(app, &runtime, &services));
+    app.connect_activate(move |app| activate(app, &runtime));
     app.run()
 }
 
@@ -65,55 +64,19 @@ fn init_logging() {
 }
 
 /// Shows the main window, or raises it if the application is already running.
-fn activate(
-    app: &gtk::Application,
-    runtime: &Arc<tokio::runtime::Runtime>,
-    services: &Rc<RefCell<Option<Services>>>,
-) {
+fn activate(app: &gtk::Application, runtime: &Arc<tokio::runtime::Runtime>) {
     if let Some(window) = app.active_window() {
         window.present();
         return;
     }
-    let banner = Banner::new();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.append(&banner.revealer);
-
-    let window = gtk::ApplicationWindow::builder()
-        .application(app)
-        .title(APP_NAME)
-        .default_width(1200)
-        .default_height(800)
-        .child(&content)
-        .build();
-
-    let connect_button = gtk::Button::with_label("Connect…");
-    let header = gtk::HeaderBar::new();
-    header.pack_start(&connect_button);
-    window.set_titlebar(Some(&header));
-    let parent = window.clone();
-    let dialog_runtime = Arc::clone(runtime);
-    let dialog_services = Rc::clone(services);
-    let dialog_banner = banner.clone();
-    connect_button.connect_clicked(move |_| {
-        let ready = dialog_services.borrow().clone();
-        match ready {
-            Some(ready) => connection_dialog::present(&parent, &dialog_runtime, ready),
-            None => dialog_banner.show("Studio is still starting. Try again in a moment."),
-        }
-    });
-
-    window.present();
-
-    start_services(runtime, Rc::clone(services), banner);
+    let window = window::Window::new(app, runtime);
+    window.window.present();
+    start_services(runtime, window);
 }
 
 /// Connects to the Secret Service and opens the database in the background,
 /// then reports problems in the banner.
-fn start_services(
-    runtime: &Arc<tokio::runtime::Runtime>,
-    services: Rc<RefCell<Option<Services>>>,
-    banner: Banner,
-) {
+fn start_services(runtime: &Arc<tokio::runtime::Runtime>, window: Rc<window::Window>) {
     let db_path = database_path();
     let startup = runtime.spawn(async move {
         let vault = match SecretService::connect().await {
@@ -125,6 +88,7 @@ fn start_services(
     });
 
     glib::spawn_future_local(async move {
+        let banner = window.banner().clone();
         let (vault, db) = match startup.await {
             Ok(result) => result,
             Err(err) => {
@@ -158,7 +122,7 @@ fn start_services(
             banner.show(&warnings.join("\n"));
         }
         if let Some(db) = db {
-            *services.borrow_mut() = Some(Services {
+            window.set_services(Services {
                 vault: Arc::new(vault),
                 db,
             });

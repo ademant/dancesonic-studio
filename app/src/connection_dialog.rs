@@ -32,8 +32,9 @@ pub(crate) fn present(
     parent: &gtk::ApplicationWindow,
     runtime: &Arc<tokio::runtime::Runtime>,
     services: Services,
+    on_connected: Rc<dyn Fn()>,
 ) {
-    let dialog = Dialog::new(parent, Arc::clone(runtime), services);
+    let dialog = Dialog::new(parent, Arc::clone(runtime), services, on_connected);
     dialog.window.present();
 }
 
@@ -88,6 +89,8 @@ struct Dialog {
     /// The task that completes a confirmed pairing; cancelling aborts it.
     running: RefCell<Option<tokio::task::AbortHandle>>,
     expires_at_ms: Cell<Option<i64>>,
+    /// Tells the window to open the library of the new connection.
+    on_connected: Rc<dyn Fn()>,
 }
 
 impl Dialog {
@@ -95,6 +98,7 @@ impl Dialog {
         parent: &gtk::ApplicationWindow,
         runtime: Arc<tokio::runtime::Runtime>,
         services: Services,
+        on_connected: Rc<dyn Fn()>,
     ) -> Rc<Self> {
         let window = gtk::Window::builder()
             .transient_for(parent)
@@ -251,6 +255,7 @@ impl Dialog {
             pending: RefCell::new(None),
             running: RefCell::new(None),
             expires_at_ms: Cell::new(None),
+            on_connected,
         });
         dialog.connect_signals();
         dialog
@@ -594,6 +599,7 @@ impl Dialog {
                     me.pending.borrow_mut().take();
                     me.pairing_box.set_visible(false);
                     me.on_paste_changed();
+                    (me.on_connected)();
                 }
                 Ok(Err(message)) => {
                     me.set_busy(Busy::Idle);

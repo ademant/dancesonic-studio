@@ -477,11 +477,35 @@ pub fn albums_of_artist(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-const SONG_COLUMNS: &str = "s.id, s.album_id, s.artist_id, s.title, s.album_name, s.artist_name,
+/// All albums of a server, grouped by artist, for the library sidebar. One
+/// query instead of one per artist.
+pub fn albums(conn: &Connection, server: ServerId) -> Result<Vec<Album>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, artist_id, artist_name, name, sort_name, year, mbid, cover_art
+         FROM album WHERE server_id = ?1
+         ORDER BY artist_id, year, coalesce(sort_name, name) COLLATE NOCASE, id",
+    )?;
+    let rows = stmt.query_map([server.0], |r| {
+        Ok(Album {
+            id: r.get(0)?,
+            artist_id: r.get(1)?,
+            artist_name: r.get(2)?,
+            name: r.get(3)?,
+            sort_name: r.get(4)?,
+            year: r.get(5)?,
+            mbid: r.get(6)?,
+            cover_art: r.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+pub(crate) const SONG_COLUMNS: &str =
+    "s.id, s.album_id, s.artist_id, s.title, s.album_name, s.artist_name,
     s.track, s.disc, s.year, s.duration_ms, s.mbid, s.bpm, s.tempo_confidence, s.bars_per_min,
     s.bar_pulses, s.track_gain, s.track_peak, s.size_bytes, s.suffix, s.cover_art";
 
-fn song_from_row(r: &Row<'_>) -> rusqlite::Result<Song> {
+pub(crate) fn song_from_row(r: &Row<'_>) -> rusqlite::Result<Song> {
     Ok(Song {
         id: r.get(0)?,
         album_id: r.get(1)?,
@@ -543,6 +567,68 @@ pub fn playlist_songs(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// Songs of an artist, by album and track.
+pub fn songs_of_artist(
+    conn: &Connection,
+    server: ServerId,
+    artist_id: &str,
+) -> Result<Vec<Song>, DbError> {
+    let sql = format!(
+        "SELECT {SONG_COLUMNS} FROM song s WHERE s.server_id = ?1 AND s.artist_id = ?2
+         ORDER BY s.album_name COLLATE NOCASE, s.album_id, s.disc, s.track,
+                  s.title COLLATE NOCASE, s.id"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params![server.0, artist_id], song_from_row)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The server synced most recently, with its base URL: the one the window
+/// opens with. `None` before the first connection.
+pub fn last_server(conn: &Connection) -> Result<Option<(ServerId, String)>, DbError> {
+    Ok(conn
+        .query_row(
+            "SELECT id, base_url FROM server
+             ORDER BY synced_at IS NULL, synced_at DESC, id DESC LIMIT 1",
+            [],
+            |r| Ok((ServerId(r.get(0)?), r.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// The distinct recording MBIDs of a server's songs, for DanceBrainz.
+pub fn recording_mbids(conn: &Connection, server: ServerId) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT mbid FROM song WHERE server_id = ?1 AND mbid IS NOT NULL ORDER BY mbid",
+    )?;
+    let rows = stmt.query_map([server.0], |r| r.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The section a name is listed under in the sidebar: its first letter or
+/// digit in upper case, with accents removed for the common Latin letters;
+/// `#` for digits and `…` for names without either.
+pub fn letter_of(name: &str) -> String {
+    let Some(first) = name.chars().find(|c| c.is_alphanumeric()) else {
+        return "…".to_owned();
+    };
+    if first.is_numeric() {
+        return "#".to_owned();
+    }
+    let base = match first.to_lowercase().next().unwrap_or(first) {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+        'ç' => 'c',
+        'è' | 'é' | 'ê' | 'ë' => 'e',
+        'ì' | 'í' | 'î' | 'ï' => 'i',
+        'ñ' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' => 'u',
+        'ý' | 'ÿ' => 'y',
+        other => other,
+    };
+    base.to_uppercase().collect()
+}
+
 /// Playlists of a server by name.
 pub fn playlists(conn: &Connection, server: ServerId) -> Result<Vec<(String, String)>, DbError> {
     let mut stmt = conn.prepare_cached(
@@ -590,6 +676,55 @@ fn fts_query(text: &str) -> Option<String> {
 pub(crate) mod tests {
     use super::*;
     use crate::db::tests::temp_db;
+
+    #[test]
+    fn names_are_listed_under_their_first_letter() {
+        assert_eq!(letter_of("Blowzabella"), "B");
+        assert_eq!(letter_of("alba"), "A");
+        assert_eq!(letter_of("Émile"), "E");
+        assert_eq!(letter_of("„Österreich“"), "O");
+        assert_eq!(letter_of("2 Violons"), "#");
+        assert_eq!(letter_of("…"), "…");
+        assert_eq!(letter_of(""), "…");
+        assert_eq!(letter_of("Ωmega"), "Ω");
+    }
+
+    #[test]
+    fn songs_of_an_artist_and_the_last_server() {
+        let (_dir, db) = temp_db();
+        assert_eq!(last_server(&db.reader().unwrap()).unwrap(), None);
+        let first = ensure_server(&db, "https://one.example", 1).unwrap();
+        let second = ensure_server(&db, "https://two.example", 2).unwrap();
+        // Neither synced: the newest one.
+        assert_eq!(
+            last_server(&db.reader().unwrap()).unwrap(),
+            Some((second, "https://two.example".to_owned()))
+        );
+        let mut set = full_set();
+        set.songs[0].mbid = Some("m1".into());
+        set.songs[1].mbid = Some("m1".into());
+        apply_changes(&db, first, &set, 10).unwrap();
+        let conn = db.reader().unwrap();
+        // The synced one wins over the newer unsynced one.
+        assert_eq!(
+            last_server(&conn).unwrap(),
+            Some((first, "https://one.example".to_owned()))
+        );
+        let titles: Vec<String> = songs_of_artist(&conn, first, "ar1")
+            .unwrap()
+            .into_iter()
+            .map(|s| s.title)
+            .collect();
+        assert_eq!(titles, ["An Dro", "Bourrée", "Mazurka"]);
+        assert!(songs_of_artist(&conn, second, "ar1").unwrap().is_empty());
+        assert_eq!(recording_mbids(&conn, first).unwrap(), ["m1"]);
+        let names: Vec<String> = albums(&conn, first)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(names, ["Pingha Frenzy", "Vanilla"]);
+    }
 
     pub(crate) fn song(id: &str, album: &str, title: &str) -> Song {
         Song {

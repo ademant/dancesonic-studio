@@ -25,6 +25,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_catalog.sql"),
     include_str!("migrations/0002_dance_cache.sql"),
     include_str!("migrations/0003_audio_cache.sql"),
+    include_str!("migrations/0004_play_queue.sql"),
 ];
 
 /// The schema version this build creates and understands.
@@ -427,6 +428,74 @@ pub(crate) mod tests {
             .query_row("SELECT count(*) FROM audio_cache", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0, "cache rows go with their server");
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    /// Step 3 → 4 keeps the cache rows and adds the play queue, whose rows go
+    /// with their server and are unique per song and play time.
+    #[test]
+    fn migration_3_to_4_keeps_rows_and_adds_the_play_queue() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 3).unwrap();
+        let file = format!("{}.audio", "a".repeat(64));
+        conn.execute_batch(
+            "INSERT INTO server (id, base_url, created_at) VALUES (1, 'https://music.example', 1);
+             INSERT INTO song (server_id, id, title, size_bytes, synced_at)
+                 VALUES (1, 'so-1', 'Tango', 1000, 1);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO audio_cache
+                 (server_id, song_id, file_name, size_bytes, content_type, cached_at, played_at)
+                 VALUES (1, 'so-1', ?1, 1000, 'audio/ogg', 2, 2)",
+            [&file],
+        )
+        .unwrap();
+        migrate_to(&mut conn, 4).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 4);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM song) + (SELECT count(*) FROM audio_cache)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 2);
+
+        conn.execute(
+            "INSERT INTO play_queue (server_id, song_id, played_at) VALUES (1, 'so-1', 5)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO play_queue (server_id, song_id, played_at) VALUES (1, 'so-1', 5)",
+                [],
+            )
+            .is_err(),
+            "the same play is queued once"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO play_queue (server_id, song_id, played_at) VALUES (1, '', 6)",
+                [],
+            )
+            .is_err(),
+            "an empty song id is refused"
+        );
+        conn.execute("DELETE FROM server", []).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM play_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "queued plays go with their server");
         assert!(
             conn.prepare("PRAGMA foreign_key_check")
                 .unwrap()

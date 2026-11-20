@@ -161,6 +161,14 @@ impl SubsonicClient {
         &self.server
     }
 
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    pub(crate) fn auth(&self) -> &Auth {
+        &self.auth
+    }
+
     /// Asks the server what it offers. Needs no sign-in.
     pub async fn server_info(&self) -> Result<ServerInfo, ApiError> {
         #[derive(Deserialize, Default)]
@@ -223,7 +231,7 @@ impl SubsonicClient {
 
 /// Maps a transport error without its URL, so no key-bearing address reaches
 /// an error message or log.
-fn map_transport(error: reqwest::Error) -> ApiError {
+pub(crate) fn map_transport(error: reqwest::Error) -> ApiError {
     if error.is_timeout() {
         ApiError::Timeout
     } else {
@@ -234,16 +242,24 @@ fn map_transport(error: reqwest::Error) -> ApiError {
 }
 
 /// Reads a response body up to [`MAX_RESPONSE_BYTES`].
-async fn read_limited(mut response: reqwest::Response) -> Result<Vec<u8>, ApiError> {
+async fn read_limited(response: reqwest::Response) -> Result<Vec<u8>, ApiError> {
+    read_limited_to(response, MAX_RESPONSE_BYTES).await
+}
+
+/// Reads a response body up to `limit` bytes.
+pub(crate) async fn read_limited_to(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, ApiError> {
     if response
         .content_length()
-        .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+        .is_some_and(|len| len > limit as u64)
     {
         return Err(ApiError::TooLarge);
     }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(map_transport)? {
-        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+        if body.len() + chunk.len() > limit {
             return Err(ApiError::TooLarge);
         }
         body.extend_from_slice(&chunk);
