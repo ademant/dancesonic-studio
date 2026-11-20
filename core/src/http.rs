@@ -55,15 +55,50 @@ fn pinned_certificates(pem: &[u8]) -> Result<Vec<Certificate>, HttpError> {
         .collect()
 }
 
+/// Longest a stream may go without any bytes arriving.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest an idle stream connection is kept for reuse. Below the 5 s after
+/// which Apache closes idle connections by default, so a reused connection is
+/// still open on the server.
+pub const STREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Builds the client for one server.
 pub fn client(settings: &HttpSettings) -> Result<reqwest::Client, HttpError> {
+    build(settings, Some(REQUEST_TIMEOUT))
+}
+
+/// Builds the client for audio streams. A track is much bigger than an
+/// answer, so there is no cap on the whole request; a stalled stream is cut
+/// off after [`STREAM_IDLE_TIMEOUT`] without data instead. The other rules
+/// are the same as [`client`].
+///
+/// Idle connections are kept only for [`STREAM_POOL_IDLE_TIMEOUT`]. A seek
+/// makes several requests in quick succession, and reusing the connection for
+/// them avoids a new handshake each time; a server may limit new connections
+/// per client. A connection idle longer than that may already be closed by the
+/// server: a request sent on it fails before any answer, and hyper does not
+/// retry it once written. The stream proxy retries such a request once.
+pub fn streaming_client(settings: &HttpSettings) -> Result<reqwest::Client, HttpError> {
+    build(settings, None)
+}
+
+fn build(
+    settings: &HttpSettings,
+    total_timeout: Option<Duration>,
+) -> Result<reqwest::Client, HttpError> {
     let mut builder = reqwest::Client::builder()
         .https_only(!settings.policy.allows_plain_http())
         .redirect(redirect::Policy::none())
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
         .user_agent(concat!("DanceSonicStudio/", env!("CARGO_PKG_VERSION")));
+    builder = match total_timeout {
+        Some(timeout) => builder.timeout(timeout),
+        None => builder
+            .read_timeout(STREAM_IDLE_TIMEOUT)
+            .pool_idle_timeout(STREAM_POOL_IDLE_TIMEOUT),
+    };
     if let Some(pem) = &settings.pinned_certificate_pem {
         builder = builder.tls_certs_only(pinned_certificates(pem)?);
     }
@@ -168,6 +203,7 @@ mod tests {
     #[test]
     fn default_client_builds() {
         assert!(client(&HttpSettings::default()).is_ok());
+        assert!(streaming_client(&HttpSettings::default()).is_ok());
     }
 
     #[test]

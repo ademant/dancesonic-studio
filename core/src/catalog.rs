@@ -20,6 +20,13 @@ const BPM_RANGE: std::ops::RangeInclusive<f64> = 20.0..=300.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ServerId(i64);
 
+impl ServerId {
+    /// The row id, for queries in other modules.
+    pub(crate) fn get(self) -> i64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Artist {
     pub id: String,

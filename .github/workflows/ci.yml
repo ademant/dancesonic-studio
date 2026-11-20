@@ -23,7 +23,7 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates curl git build-essential pkg-config \
-            libgtk-4-dev xvfb xauth weston
+            libgtk-4-dev libgstreamer1.0-dev xvfb xauth weston
       - uses: actions/checkout@v4
       - name: Rust toolchain (from rust-toolchain.toml)
         run: |

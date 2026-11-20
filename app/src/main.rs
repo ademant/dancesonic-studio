@@ -1,6 +1,11 @@
 //! DanceSonic Studio: the GTK4 user interface.
 
 mod connection_dialog;
+#[expect(
+    dead_code,
+    reason = "the window that drives playback is #8; the engine is tested by its use there"
+)]
+mod player;
 mod secret_service;
 
 use std::cell::RefCell;
