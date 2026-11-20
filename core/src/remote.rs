@@ -9,13 +9,17 @@
 //! - [`devices`]: paired phones and their counters, in the database.
 //! - [`hub`]: what every connection does, whatever its transport.
 //! - [`ble`]: framing over GATT and the Noise session for Bluetooth.
+//! - [`network`]: HTTPS and WebSocket on the local network, with mDNS.
+//! - [`settings`]: the switches, off by default.
 
 pub mod ble;
 pub mod devices;
 pub mod hub;
 pub mod identity;
 pub mod messages;
+pub mod network;
 pub mod offer;
+pub mod settings;
 
 #[cfg(test)]
 pub(crate) mod phone;

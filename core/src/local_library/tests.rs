@@ -177,6 +177,15 @@ fn a_scan_adds_updates_follows_moves_and_drops_gone_files() {
     );
     let none = local_only_songs(&conn, None, &LocalFilter::Search("%".into()), 100).unwrap();
     assert!(none.is_empty(), "LIKE wildcards are searched literally");
+    // A remote control names a local track by its ID (#20).
+    let id = songs[1].local_id.unwrap();
+    let by_id = local_only_songs(&conn, None, &LocalFilter::Id(id), 100).unwrap();
+    assert_eq!(titles(&by_id), ["Two (live)"]);
+    assert!(
+        local_only_songs(&conn, None, &LocalFilter::Id(i64::MAX), 100)
+            .unwrap()
+            .is_empty()
+    );
 
     remove_folder(&db, folder.id).unwrap();
     let left: i64 = conn

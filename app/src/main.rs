@@ -4,6 +4,8 @@ mod connection_dialog;
 mod folders_dialog;
 mod mpris;
 mod player;
+mod remote;
+mod remote_dialog;
 mod secret_service;
 mod seek_bar;
 mod session;

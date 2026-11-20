@@ -27,6 +27,8 @@ use crate::seek_bar::SeekBar;
 use crate::session::{self, Catalog, Selection, Session};
 use crate::{Banner, Services, connection_dialog, folders_dialog};
 
+mod remote_commands;
+
 /// How often the position is read from the engine.
 const POSITION_TICK: Duration = Duration::from_millis(250);
 
@@ -65,6 +67,10 @@ pub(crate) struct Window {
     plays: RefCell<PlayCounter>,
     /// Watches the local music folders (#10).
     watcher: RefCell<Option<FolderWatcher>>,
+    /// Remote control by phones (#20, #24).
+    remote: RefCell<Option<Rc<crate::remote::Remote>>>,
+    /// The state the phones were last told, and when.
+    published: RefCell<(Option<studio_core::remote::messages::PlayState>, i64)>,
 }
 
 struct Sidebar {
@@ -120,6 +126,8 @@ struct PlayerBar {
     speed: gtk::Scale,
     speed_label: gtk::Label,
     reset: gtk::Button,
+    /// "BT" or "Wi-Fi" while a phone controls Studio.
+    remote: gtk::Label,
     /// Set while code moves the speed slider, so it does not change the rate.
     updating: Cell<bool>,
 }
@@ -183,10 +191,12 @@ impl Window {
             "Update the library from the server",
         );
         let folders_button = icon_button("folder-music-symbolic", "Music folders on this computer");
+        let remote_button = icon_button("phone-symbolic", "Remote control by a phone");
         let header = gtk::HeaderBar::new();
         header.pack_start(&connect_button);
         header.pack_start(&sync_button);
         header.pack_start(&folders_button);
+        header.pack_end(&remote_button);
         header.set_title_widget(Some(&search));
         window.set_titlebar(Some(&header));
 
@@ -207,6 +217,8 @@ impl Window {
             now_playing: Cell::new(None),
             plays: RefCell::default(),
             watcher: RefCell::default(),
+            remote: RefCell::default(),
+            published: RefCell::default(),
             playing: Cell::new(false),
             rate: Cell::new(Rate::NORMAL),
             request: Cell::new(0),
@@ -231,6 +243,12 @@ impl Window {
         folders_button.connect_clicked(move |_| {
             if let Some(me) = weak.upgrade() {
                 me.show_folders();
+            }
+        });
+        let weak = Rc::downgrade(&me);
+        remote_button.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.show_remote();
             }
         });
         me.show_detail(None);
@@ -520,6 +538,7 @@ impl Window {
 
     /// The services are ready: open the last server.
     pub(crate) fn set_services(self: &Rc<Self>, services: Services) {
+        self.start_remote(&services);
         *self.services.borrow_mut() = Some(services);
         self.open_session();
         self.watch_folders();
@@ -930,6 +949,7 @@ impl Window {
     }
 
     fn tick(self: &Rc<Self>) {
+        self.publish_remote();
         let position = self.player.borrow().as_ref().and_then(Player::position_ms);
         let Some((position, length)) = position else {
             return;
@@ -1773,6 +1793,10 @@ impl PlayerBar {
             .css_classes(["numeric"])
             .build();
         let reset = icon_button("edit-undo-symbolic", "Back to the original speed (100 %)");
+        let remote = gtk::Label::builder()
+            .css_classes(["dim-label"])
+            .visible(false)
+            .build();
 
         let transport = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         transport.append(&previous);
@@ -1780,6 +1804,7 @@ impl PlayerBar {
         transport.append(&next);
         transport.append(&time);
         transport.append(&now);
+        transport.append(&remote);
         transport.append(&modes);
         transport.append(&speed);
         transport.append(&speed_label);
@@ -1808,6 +1833,7 @@ impl PlayerBar {
             speed,
             speed_label,
             reset,
+            remote,
             updating: Cell::new(false),
         }
     }
@@ -2207,6 +2233,36 @@ mod ui_check {
         gdbus(&all);
     }
 
+    fn find_button(widget: &gtk::Widget, label: &str) -> Option<gtk::Button> {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>()
+            && button.label().as_deref() == Some(label)
+        {
+            return Some(button.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            if let Some(found) = find_button(&c, label) {
+                return Some(found);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    fn find_picture(widget: &gtk::Widget) -> Option<gtk::Picture> {
+        if let Some(picture) = widget.downcast_ref::<gtk::Picture>() {
+            return Some(picture.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            if let Some(found) = find_picture(&c) {
+                return Some(found);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
     fn pump(millis: u64) {
         let context = glib::MainContext::default();
         let end = std::time::Instant::now() + Duration::from_millis(millis);
@@ -2533,6 +2589,89 @@ mod ui_check {
             "named by a hash: {stored:?}"
         );
         save(window.window.upcast_ref(), &shots.join("6-offline.png"));
+
+        // Remote control (#20): off until turned on, then a pairing code,
+        // and a phone's commands carried out by the window.
+        let remote = window.remote.borrow().clone().expect("remote control");
+        assert!(!remote.settings().network, "off by default");
+        let mut on = remote.settings();
+        on.network = true;
+        remote.set(on);
+        pump(2000);
+        assert!(
+            remote.status().contains("can find Studio"),
+            "{}",
+            remote.status()
+        );
+        window.show_remote();
+        pump(300);
+        let dialog = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Remote control"))
+            .expect("the remote control dialog");
+        find_button(dialog.upcast_ref(), "Pair a phone…")
+            .expect("pair button")
+            .emit_clicked();
+        pump(300);
+        let code = find_picture(dialog.upcast_ref()).expect("QR code");
+        assert!(code.paintable().is_some() && code.is_visible());
+        save(dialog.upcast_ref(), &shots.join("7-remote.png"));
+        dialog.close();
+        pump(200);
+
+        use studio_core::remote::messages::Command as Remote;
+        let ask = |command: Remote| {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            window.on_remote_command(command, tx);
+            pump(1500);
+            rx.try_recv().expect("an answer")
+        };
+        let ids =
+            || -> Vec<String> { window.queue.borrow().iter().map(|s| s.id.clone()).collect() };
+        assert_eq!(
+            ask(Remote::PlaySongs {
+                songs: vec!["so-2".into(), "so-1".into()],
+                start: 1
+            }),
+            Ok(None)
+        );
+        assert_eq!(ids(), ["so-2", "so-1"]);
+        assert_eq!(window.now_playing.get(), Some(1));
+        assert_eq!(
+            ask(Remote::Enqueue {
+                songs: vec!["so-4".into()]
+            }),
+            Ok(None)
+        );
+        assert_eq!(ids(), ["so-2", "so-1", "so-4"], "appended");
+        assert_eq!(window.now_playing.get(), Some(1), "without a restart");
+        assert_eq!(
+            ask(Remote::PlaySongs {
+                songs: vec!["no-such-song".into()],
+                start: 0
+            }),
+            Err("unknown_song")
+        );
+        assert_eq!(ask(Remote::SetRate { rate: 1.2 }), Ok(None));
+        assert!((window.rate.get().factor() - 1.2).abs() < 1e-9);
+        assert_eq!(ask(Remote::Pause), Ok(None));
+        assert!(!window.playing.get());
+        let published = window.published.borrow().0.clone().expect("state sent");
+        assert_eq!(published.song.as_deref(), Some("so-1"));
+        assert!(!published.playing);
+        assert_eq!(published.queue.len(), 3);
+        let artists = ask(Remote::LibraryArtists).expect("artists").expect("data");
+        assert!(
+            artists.as_array().is_some_and(|a| !a.is_empty()),
+            "{artists}"
+        );
+
+        let mut off = remote.settings();
+        off.network = false;
+        remote.set(off);
+        pump(500);
+        assert_eq!(remote.status(), "Remote control is off.");
         window.window.destroy();
         pump(300);
     }

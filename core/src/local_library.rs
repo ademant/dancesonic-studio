@@ -124,8 +124,13 @@ pub struct LocalArtist {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalFilter {
     Artist(String),
-    Album { artist: String, album: String },
+    Album {
+        artist: String,
+        album: String,
+    },
     Search(String),
+    /// One track by its local ID (the number in `local:<n>`).
+    Id(i64),
 }
 
 /// Adds a folder. The path is made absolute and resolved, so the same folder
@@ -687,6 +692,14 @@ pub fn local_only_songs(
                 String::new(),
             )
         }
+        LocalFilter::Id(id) => (
+            format!(
+                "SELECT {columns} FROM local_track t WHERE {LOCAL_ONLY}
+                 AND t.id = CAST(?2 AS INTEGER) AND ?3 = ?3 {order}"
+            ),
+            id.to_string(),
+            String::new(),
+        ),
     };
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params![server, a, b, limit], |r| {

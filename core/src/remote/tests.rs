@@ -21,7 +21,7 @@ use crate::db::Database;
 const START_MS: i64 = 1_800_000_000_000;
 
 #[derive(Debug)]
-struct TestClock(AtomicI64);
+pub(crate) struct TestClock(AtomicI64);
 
 impl Clock for TestClock {
     fn now_ms(&self) -> i64 {
@@ -37,21 +37,21 @@ impl TestClock {
 
 /// What the app was asked, and how it answers.
 #[derive(Default)]
-struct App {
-    accept: bool,
-    commands: Vec<Command>,
-    paired: Vec<String>,
+pub(crate) struct App {
+    pub(crate) accept: bool,
+    pub(crate) commands: Vec<Command>,
+    pub(crate) paired: Vec<String>,
 }
 
-struct Rig {
+pub(crate) struct Rig {
     _dir: tempfile::TempDir,
-    db: Arc<Database>,
-    hub: Arc<Hub>,
-    clock: Arc<TestClock>,
-    app: Arc<Mutex<App>>,
+    pub(crate) db: Arc<Database>,
+    pub(crate) hub: Arc<Hub>,
+    pub(crate) clock: Arc<TestClock>,
+    pub(crate) app: Arc<Mutex<App>>,
 }
 
-fn rig() -> Rig {
+pub(crate) fn rig() -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Database::open(dir.path().join("studio.db")).unwrap());
     let identity = Arc::new(Identity::generate().unwrap());
@@ -189,6 +189,64 @@ fn identity_survives_the_secret_store_and_binds_both_keys() {
     assert!(Identity::from_secret(&SecretSlice::from(bytes)).is_err());
     assert!(Identity::from_secret(&SecretSlice::from(vec![2u8; 200])).is_err());
     assert!(!format!("{identity:?}").contains("noise_private"));
+}
+
+#[tokio::test]
+async fn the_identity_is_kept_in_the_vault_and_survives_sign_out() {
+    use super::identity::{IDENTITY_ACCOUNT, load_or_create, reset};
+    use crate::secrets::{SecretKind, SecretVault};
+    #[derive(Debug)]
+    struct NoService;
+    impl crate::secrets::SecretBackend for NoService {
+        async fn store(
+            &self,
+            _: &crate::secrets::SecretId,
+            _: &SecretSlice<u8>,
+        ) -> Result<(), crate::secrets::BackendError> {
+            unreachable!()
+        }
+        async fn read(
+            &self,
+            _: &crate::secrets::SecretId,
+        ) -> Result<Option<SecretSlice<u8>>, crate::secrets::BackendError> {
+            unreachable!()
+        }
+        async fn delete(
+            &self,
+            _: &crate::secrets::SecretId,
+        ) -> Result<(), crate::secrets::BackendError> {
+            unreachable!()
+        }
+    }
+    let vault = SecretVault::<NoService>::session_only("test");
+    let first = load_or_create(&vault).await.unwrap();
+    let again = load_or_create(&vault).await.unwrap();
+    assert_eq!(first.fingerprint(), again.fingerprint(), "kept");
+    // Signing out of a server deletes that server's secrets only.
+    vault.delete_account("https://music.example").await.unwrap();
+    assert_eq!(
+        load_or_create(&vault).await.unwrap().fingerprint(),
+        first.fingerprint()
+    );
+    let fresh = reset(&vault).await.unwrap();
+    assert_ne!(
+        fresh.fingerprint(),
+        first.fingerprint(),
+        "a reset makes new keys"
+    );
+    assert_eq!(
+        load_or_create(&vault).await.unwrap().fingerprint(),
+        fresh.fingerprint()
+    );
+    // A damaged entry is replaced rather than half-read.
+    let id =
+        crate::secrets::SecretId::new(SecretKind::RemoteIdentityKey, IDENTITY_ACCOUNT).unwrap();
+    vault
+        .store(&id, &SecretSlice::from(vec![1u8; 10]))
+        .await
+        .unwrap();
+    let replaced = load_or_create(&vault).await.unwrap();
+    assert_ne!(replaced.fingerprint(), fresh.fingerprint());
 }
 
 #[test]

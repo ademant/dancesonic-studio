@@ -577,6 +577,26 @@ pub fn songs_of_album(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// The songs with these IDs, in the order asked; unknown IDs are left out.
+pub fn songs_by_id(
+    conn: &Connection,
+    server: ServerId,
+    ids: &[String],
+) -> Result<Vec<Song>, DbError> {
+    let sql = format!("SELECT {SONG_COLUMNS} FROM song s WHERE s.server_id = ?1 AND s.id = ?2");
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(song) = stmt
+            .query_row(params![server.0, id], song_from_row)
+            .optional()?
+        {
+            out.push(song);
+        }
+    }
+    Ok(out)
+}
+
 /// Songs of a playlist in playlist order. Entries whose song is not in the
 /// catalog are left out.
 pub fn playlist_songs(

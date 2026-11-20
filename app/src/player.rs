@@ -277,6 +277,18 @@ impl Player {
         self.play_current()
     }
 
+    /// Adds songs at the end of the queue without interrupting playback.
+    pub(crate) fn append(&mut self, tracks: Vec<Track>) -> Result<(), PlayerError> {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .queue
+            .append(tracks.iter().map(|t| t.song.clone()).collect())?;
+        inner.tracks.extend(tracks);
+        // The song after the current one may be new now.
+        set_prepared(&self.prepared_next, inner.next_uri());
+        Ok(())
+    }
+
     /// The queue position of the song that plays.
     #[cfg(test)]
     pub(crate) fn current_index(&self) -> Option<usize> {

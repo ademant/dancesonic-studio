@@ -29,6 +29,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0005_local_library.sql"),
     include_str!("migrations/0006_offline.sql"),
     include_str!("migrations/0007_remote_devices.sql"),
+    include_str!("migrations/0008_remote_settings.sql"),
 ];
 
 /// The schema version this build creates and understands.
@@ -489,6 +490,39 @@ pub(crate) mod tests {
                 .unwrap()
                 .next()
                 .is_none()
+        );
+    }
+
+    /// Step 7 → 8 keeps paired phones and adds the remote switches, off.
+    #[test]
+    fn migration_7_to_8_keeps_phones_and_starts_with_remote_control_off() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 7).unwrap();
+        conn.execute(
+            "INSERT INTO remote_device (id, name, device_key, noise_key, last_counter, paired_at)
+             VALUES (?1, 'Phone', ?2, ?3, 4, 1)",
+            rusqlite::params!["a".repeat(32), vec![4u8; 65], vec![1u8; 32]],
+        )
+        .unwrap();
+        migrate_to(&mut conn, 8).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 8);
+        let counter: i64 = conn
+            .query_row("SELECT last_counter FROM remote_device", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(counter, 4);
+        let settings = crate::remote::settings::load(&conn).unwrap();
+        assert!(!settings.network && !settings.bluetooth, "off by default");
+        assert_eq!(settings.port, 47800);
+        assert!(
+            conn.execute("UPDATE remote_settings SET port = 80", [])
+                .is_err(),
+            "no privileged port"
+        );
+        assert!(
+            conn.execute("INSERT INTO remote_settings (id) VALUES (2)", [])
+                .is_err(),
+            "one settings row"
         );
     }
 

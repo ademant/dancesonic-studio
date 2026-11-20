@@ -25,6 +25,45 @@ pub enum IdentityError {
     Damaged,
     #[error("cannot create the certificate: {0}")]
     Certificate(String),
+    #[error("cannot keep the remote control key: {0}")]
+    Secret(#[from] crate::secrets::SecretError),
+}
+
+/// The Secret Service account of Studio's own identity. Not a server URL, so
+/// signing out of a server never deletes it.
+pub const IDENTITY_ACCOUNT: &str = "this-studio";
+
+fn secret_id() -> Result<crate::secrets::SecretId, IdentityError> {
+    Ok(crate::secrets::SecretId::new(
+        crate::secrets::SecretKind::RemoteIdentityKey,
+        IDENTITY_ACCOUNT,
+    )?)
+}
+
+/// Reads Studio's identity from the vault, or makes and stores a new one
+/// when there is none or it is damaged.
+pub async fn load_or_create<B: crate::secrets::SecretBackend>(
+    vault: &crate::secrets::SecretVault<B>,
+) -> Result<Identity, IdentityError> {
+    let id = secret_id()?;
+    if let Some(secret) = vault.read(&id).await? {
+        match Identity::from_secret(&secret) {
+            Ok(identity) => return Ok(identity),
+            Err(error) => tracing::warn!(%error, "making a new remote control key"),
+        }
+    }
+    reset(vault).await
+}
+
+/// Makes and stores a new identity. Phones paired with the old one no longer
+/// recognise Studio and must pair again.
+pub async fn reset<B: crate::secrets::SecretBackend>(
+    vault: &crate::secrets::SecretVault<B>,
+) -> Result<Identity, IdentityError> {
+    let identity = Identity::generate()?;
+    vault.store(&secret_id()?, &identity.to_secret()).await?;
+    tracing::info!("remote control key created");
+    Ok(identity)
 }
 
 /// Studio's identity. `Debug` prints only the fingerprint.
@@ -174,11 +213,7 @@ impl Identity {
 
     /// The short tag in the mDNS TXT record.
     pub fn mdns_tag(&self) -> String {
-        let hash = Sha256::new()
-            .chain_update(MDNS_LABEL)
-            .chain_update(self.fingerprint)
-            .finalize();
-        super::b64u(&hash[..8])
+        mdns_tag_of(&self.fingerprint)
     }
 
     /// A self-signed certificate for the network transport. Made fresh on
@@ -206,6 +241,15 @@ pub fn fingerprint(tls_spki: &[u8], noise_public: &[u8]) -> [u8; 32] {
         .chain_update(noise_public)
         .finalize()
         .into()
+}
+
+/// The mDNS TXT tag of a fingerprint: the first 8 bytes of a labelled hash.
+pub fn mdns_tag_of(fingerprint: &[u8; 32]) -> String {
+    let hash = Sha256::new()
+        .chain_update(MDNS_LABEL)
+        .chain_update(fingerprint)
+        .finalize();
+    super::b64u(&hash[..8])
 }
 
 /// A Noise builder for [`NOISE_PARAMS`].

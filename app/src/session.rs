@@ -69,6 +69,8 @@ pub(crate) enum Selection {
     Dance(i64),
     Playlist(String),
     Search(String),
+    /// Songs by ID, in this order: server IDs and `local:<n>` (#20).
+    Ids(Vec<String>),
 }
 
 /// The settings for a stored server: plain http only for an address that was
@@ -360,6 +362,22 @@ impl Session {
                     let mut songs = catalog::search_songs(&conn, server, text, SEARCH_LIMIT)
                         .map_err(|e| e.to_string())?;
                     songs.extend(local(LocalFilter::Search(text.clone()))?);
+                    songs
+                }
+                Selection::Ids(ids) => {
+                    let mut songs = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        match id
+                            .strip_prefix(local_library::LOCAL_ID_PREFIX)
+                            .and_then(|n| n.parse::<i64>().ok())
+                        {
+                            Some(n) => songs.extend(local(LocalFilter::Id(n))?),
+                            None => songs.extend(
+                                catalog::songs_by_id(&conn, server, std::slice::from_ref(id))
+                                    .map_err(|e| e.to_string())?,
+                            ),
+                        }
+                    }
                     songs
                 }
             };

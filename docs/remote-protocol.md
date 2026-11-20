@@ -162,7 +162,7 @@ local folders. The phone resolves names and covers from its own library cache.
 | `set_rate` | `rate`, 0.5 to 1.5 | both |
 | `set_bpm` | `bpm`, 20 to 300: the target BPM; Studio sets the rate from the track's BPM | both |
 | `play_songs` | `songs` (at most 1000 IDs), `start` | both |
-| `enqueue` | `songs` (at most 1000 IDs) | both |
+| `enqueue` | `songs` (at most 1000 IDs); when nothing is queued they start playing | both |
 | `play_dance` | `tag_id`: plays the dance's songs | both |
 | `next_of_dance` | `tag_id`: plays a song of this dance next, now | both |
 | `play_playlist` | `playlist`, `start` | both |
@@ -171,6 +171,18 @@ local folders. The phone resolves names and covers from its own library cache.
 | `library_albums` | `artist` | network |
 | `library_songs` | one of `album`, `artist`, `playlist`, `dance`, `query` | network |
 | `cover` | `id`: answer `data.image` (b64u, at most 256 KiB) and `data.content_type` | network |
+
+Answers of the library commands (`data`):
+
+| `cmd` | `data` |
+|---|---|
+| `library_artists` | `[{ "id", "name" }]` |
+| `library_albums` | `[{ "id", "name", "year" }]` |
+| `library_playlists` | `[{ "id", "name" }]` |
+| `library_dances` | `[{ "tag_id", "name" }]` |
+| `library_songs` | `[{ "id", "title", "artist", "album", "duration_ms", "bpm" }]`, at most 1000 |
+
+`year`, `artist`, `album`, `duration_ms` and `bpm` may be `null`.
 
 ### Features
 
@@ -227,8 +239,12 @@ A command outside the transport's features is refused with
   frame, at most 64 KiB.
 - **Channel binding:** the TLS exporter with label
   `EXPORTER-dancesonic-studio-v1`, no context, 32 bytes (RFC 8446 section 7.5).
-- Studio listens only on private, link-local or loopback addresses and refuses
-  connections from other addresses.
+- Studio accepts connections only from private, link-local, unique-local or
+  loopback addresses and closes any other at once. It tries port 47800 first
+  and takes a free one when that is in use; phones learn the port from mDNS or
+  the network hint.
+- mDNS is re-announced whenever Studio's addresses change, for example when a
+  laptop moves to another Wi-Fi.
 
 ### Switching
 

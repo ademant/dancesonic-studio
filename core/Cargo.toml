@@ -16,13 +16,17 @@ base64 = "0.22"
 bytes = "1.12"
 subtle = "2.6"
 getrandom = "0.3"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 hmac = "0.13"
+if-addrs = "0.15"
 lofty = "0.25.5"
+mdns-sd = { version = "0.22", default-features = false }
 notify = { version = "8.2.2", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic", "std", "pkcs8"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 rusqlite = { version = "0.43.0", default-features = false, features = ["bundled", "cache"] }
+rustls = "0.23.46"
 rustls-pki-types = { version = "1.16.0", features = ["std"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -31,6 +35,8 @@ snow = { version = "0.10", default-features = false, features = ["std", "default
 sha2 = "0.11"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync", "macros", "time", "net", "io-util", "fs"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tracing = "0.1.44"
 url = "2.5.8"
 
@@ -39,8 +45,6 @@ workspace = true
 
 [dev-dependencies]
 rcgen = "0.14"
-rustls = "0.23.46"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "rt-multi-thread", "net", "io-util"] }
-tokio-rustls = "0.26.6"
 wiremock = "0.6.5"
