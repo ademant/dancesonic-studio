@@ -7,6 +7,7 @@ mod connection_dialog;
 )]
 mod player;
 mod secret_service;
+mod track_feed;
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
