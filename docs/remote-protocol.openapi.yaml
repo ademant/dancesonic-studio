@@ -1,0 +1,67 @@
+openapi: 3.1.0
+info:
+  title: DanceSonic Studio remote control, network transport
+  version: "1"
+  description: |
+    The HTTPS endpoints Studio offers on the local network while "Allow remote
+    control" is on. See remote-protocol.md for keys, pairing and messages.
+
+    TLS 1.3 only, with Studio's self-signed certificate. The phone pins it by
+    Studio's fingerprint from the QR code: it computes
+    `SHA-256("dancesonic-studio-id-v1\0" || SPKI_DER || noise_key)` from the
+    certificate and `noise_key` from `/v1/info` and compares it with the pinned
+    value before sending anything else. No plain http.
+servers:
+  - url: https://{address}:{port}
+    description: An address and port found by mDNS (`_dancesonic._tcp`) or the Bluetooth network hint.
+    variables:
+      address:
+        default: studio.local
+      port:
+        default: "47800"
+paths:
+  /v1/info:
+    get:
+      summary: Who this Studio is (unauthenticated).
+      responses:
+        "200":
+          description: Studio's protocol version, name and Noise public key.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [protocol, name, noise_key, fp_tag]
+                properties:
+                  protocol:
+                    const: 1
+                  name:
+                    type: string
+                    maxLength: 64
+                  noise_key:
+                    type: string
+                    description: 32-byte X25519 public key, base64url without padding.
+                  fp_tag:
+                    type: string
+                    description: The mDNS fingerprint tag, base64url without padding.
+  /v1/session:
+    get:
+      summary: Opens the session (WebSocket upgrade).
+      description: |
+        After the upgrade, every protocol message is one WebSocket text frame,
+        at most 64 KiB. The phone's first message is `pair_request` or `hello`
+        (see remote-protocol.schema.json). The channel binding is the TLS
+        exporter with label `EXPORTER-dancesonic-studio-v1`, no context, 32 bytes.
+      parameters:
+        - in: header
+          name: Upgrade
+          required: true
+          schema:
+            const: websocket
+      responses:
+        "101":
+          description: Switching to the WebSocket session.
+        "400":
+          description: Not a WebSocket upgrade.
+        "429":
+          description: Too many connections.

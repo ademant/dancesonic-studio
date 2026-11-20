@@ -28,6 +28,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0004_play_queue.sql"),
     include_str!("migrations/0005_local_library.sql"),
     include_str!("migrations/0006_offline.sql"),
+    include_str!("migrations/0007_remote_devices.sql"),
 ];
 
 /// The schema version this build creates and understands.
@@ -489,6 +490,44 @@ pub(crate) mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    /// Step 6 → 7 keeps offline pins and adds paired phones, which hold
+    /// only well-formed public keys and a counter that never goes negative.
+    #[test]
+    fn migration_6_to_7_keeps_rows_and_adds_remote_devices() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 6).unwrap();
+        conn.execute_batch(
+            "INSERT INTO offline_pin (base_url, kind, item_id, pinned_at)
+                 VALUES ('https://music.example', 'album', 'al-1', 1);",
+        )
+        .unwrap();
+        migrate_to(&mut conn, 7).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 7);
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM offline_pin", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
+        let insert = |id: &str, key_len: usize, noise: u8, counter: i64| {
+            conn.execute(
+                "INSERT INTO remote_device (id, name, device_key, noise_key, last_counter,
+                     paired_at) VALUES (?1, 'Phone', ?2, ?3, ?4, 1)",
+                rusqlite::params![id, vec![4u8; key_len], vec![noise; 32], counter],
+            )
+        };
+        insert(&"a".repeat(32), 65, 1, 0).unwrap();
+        assert!(
+            insert(&"b".repeat(32), 64, 2, 0).is_err(),
+            "SEC1 points only"
+        );
+        assert!(
+            insert(&"c".repeat(32), 65, 1, 0).is_err(),
+            "one phone per Noise key"
+        );
+        assert!(insert(&"d".repeat(32), 65, 3, -1).is_err(), "counter >= 0");
+        assert!(insert("short", 65, 4, 0).is_err(), "id shape");
     }
 
     /// Step 4 → 5 keeps queued plays and adds the local library, whose

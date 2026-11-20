@@ -19,6 +19,7 @@ pub mod offline;
 pub mod pairing;
 pub mod plays;
 pub mod queue;
+pub mod remote;
 pub mod secrets;
 pub mod server_extras;
 pub mod sign_in;
