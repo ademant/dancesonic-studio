@@ -790,3 +790,116 @@ fn the_pair_transcript_is_what_the_document_says() {
     assert!(from_b64u("AAAA", 2).is_none(), "longer than allowed");
     assert!(from_b64u("A+A=", 8).is_none(), "not base64url");
 }
+
+/// Pairs over Bluetooth and returns the open link after `welcome` and the
+/// first `state`.
+async fn ble_paired(rig: &Rig, phone: &mut Phone) -> BlePhone {
+    let (uri, _) = rig.hub.new_offer().unwrap();
+    let scanned = scan(uri.expose_secret());
+    let mut link = ble_connect(rig, phone).await;
+    link.recv().await; // identity
+    let binding = link.binding;
+    link.send(&phone.pair_request(&scanned, &binding, "Pixel"))
+        .await;
+    link.recv().await; // pending
+    phone.device = DeviceId::parse(link.recv().await["device"].as_str().unwrap());
+    link.send(&phone.hello(&binding)).await;
+    assert_eq!(link.recv().await["type"], "welcome");
+    assert_eq!(link.recv().await["type"], "state");
+    link
+}
+
+#[tokio::test]
+async fn the_phone_notices_a_studio_with_the_wrong_key_over_bluetooth() {
+    let ours = rig();
+    let other = rig();
+    let (uri, _) = ours.hub.new_offer().unwrap();
+    let scanned = scan(uri.expose_secret());
+    // Another Studio answers on the advertised service.
+    let phone = Phone::new();
+    let mut link = ble_connect(&other, &phone).await;
+    let identity = link.recv().await;
+    let spki = from_b64u(identity["tls_spki"].as_str().unwrap(), 4096).unwrap();
+    assert_ne!(
+        fingerprint(&spki, &link.studio_static),
+        scanned.fp,
+        "the phone stops here"
+    );
+    // A Studio that sends our certificate key but has another Noise key is
+    // caught too: the fingerprint binds both.
+    let our_spki = ours.hub.identity().tls_spki();
+    assert_ne!(fingerprint(our_spki, &link.studio_static), scanned.fp);
+}
+
+#[tokio::test]
+async fn unsigned_replayed_and_revoked_commands_are_refused_over_bluetooth() {
+    let rig = rig();
+    let mut phone = Phone::new();
+    let mut link = ble_paired(&rig, &mut phone).await;
+    let unsigned = serde_json::json!({
+        "type": "command", "counter": 99, "body": r#"{"cmd":"play"}"#, "sig": ""
+    })
+    .to_string();
+    link.send(unsigned.as_bytes()).await;
+    assert_eq!(link.recv().await["code"], "bad_signature");
+    let (_, pause) = phone.command(r#"{"cmd":"pause"}"#);
+    link.send(&pause).await;
+    assert_eq!(link.recv().await["ok"], true);
+    link.send(&pause).await;
+    assert_eq!(link.recv().await["code"], "replay");
+    rig.hub.revoke(phone.device.as_ref().unwrap()).unwrap();
+    assert_eq!(link.recv().await["reason"], "revoked");
+    assert_eq!(rig.app.lock().unwrap().commands, [Command::Pause]);
+}
+
+#[tokio::test]
+async fn the_phone_switches_bluetooth_network_bluetooth_without_pairing_again() {
+    let rig = rig();
+    let mut phone = Phone::new();
+    let mut ble = ble_paired(&rig, &mut phone).await;
+    let (_, play) = phone.command(r#"{"cmd":"play"}"#);
+    ble.send(&play).await;
+    assert_eq!(ble.recv().await["ok"], true);
+    rig.hub.publish_state(PlayState {
+        playing: true,
+        song: Some("so-1".into()),
+        rate: 1.0,
+        ..PlayState::default()
+    });
+    assert_eq!(ble.recv().await["song"], "so-1");
+
+    // The phone walks out of range: the link drops, playback goes on.
+    drop(ble);
+    let mut net = Conn::open(&rig.hub, Transport::Network, 6, None);
+    let welcome = hello(&mut net, &mut phone).await;
+    assert_eq!(welcome["transport"], "network");
+    let state = net.recv().await;
+    assert_eq!(
+        (state["playing"].clone(), state["song"].clone()),
+        (true.into(), "so-1".into())
+    );
+    let (_, next) = phone.command(r#"{"cmd":"next"}"#);
+    net.send(next).await;
+    assert_eq!(net.recv().await["ok"], true);
+    drop(net);
+
+    // Back in range: Bluetooth again, same keys, the counter goes on.
+    let mut ble = ble_connect(&rig, &phone).await;
+    ble.recv().await; // identity
+    let binding = ble.binding;
+    ble.send(&phone.hello(&binding)).await;
+    assert_eq!(ble.recv().await["transport"], "ble");
+    assert_eq!(ble.recv().await["song"], "so-1");
+    let (_, pause) = phone.command(r#"{"cmd":"pause"}"#);
+    ble.send(&pause).await;
+    assert_eq!(ble.recv().await["ok"], true);
+    assert_eq!(
+        rig.app.lock().unwrap().commands,
+        [Command::Play, Command::Next, Command::Pause]
+    );
+    assert_eq!(
+        devices::list(&rig.db.reader().unwrap()).unwrap().len(),
+        1,
+        "one pairing"
+    );
+}

@@ -18,6 +18,7 @@ use studio_core::remote::settings::{self, Settings};
 use studio_core::secrets::{Persistence, SecretVault};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::ble_remote::BleRemote;
 use crate::secret_service::SecretService;
 
 /// Called when the status, the sessions or the phones change.
@@ -52,8 +53,11 @@ pub(crate) struct Remote {
     settings: Cell<Settings>,
     hub: RefCell<Option<Arc<Hub>>>,
     network: RefCell<Option<NetworkRemote>>,
+    ble: RefCell<Option<BleRemote>>,
     sessions: RefCell<Vec<Connected>>,
-    status: RefCell<String>,
+    /// What the network transport, Bluetooth and the keyring say.
+    network_status: RefCell<String>,
+    ble_status: RefCell<String>,
     listeners: RefCell<Vec<(u64, Listener)>>,
     next_listener: Cell<u64>,
 }
@@ -79,8 +83,10 @@ impl Remote {
             }),
             hub: RefCell::new(None),
             network: RefCell::new(None),
+            ble: RefCell::new(None),
             sessions: RefCell::new(Vec::new()),
-            status: RefCell::new("Remote control is off.".to_owned()),
+            network_status: RefCell::new(String::new()),
+            ble_status: RefCell::new(String::new()),
             listeners: RefCell::new(Vec::new()),
             next_listener: Cell::new(0),
         })
@@ -133,62 +139,83 @@ impl Remote {
         if !settings.network {
             // Stops the server and withdraws the announcement.
             self.network.borrow_mut().take();
+            self.network_status.borrow_mut().clear();
+        }
+        if !settings.bluetooth {
+            // Stops the service and the advertisement.
+            self.ble.borrow_mut().take();
+            self.ble_status.borrow_mut().clear();
         }
         if !settings.network && !settings.bluetooth {
-            self.set_status("Remote control is off.");
+            self.notify();
             return;
         }
         let Some(hub) = self.hub().await else { return };
         if settings.network && self.network.borrow().is_none() {
-            let task_hub = Arc::clone(&hub);
-            let started = self
-                .runtime
-                .spawn(async move {
-                    let announcer: Box<dyn Announcer> =
-                        match MdnsAnnouncer::new(task_hub.identity(), task_hub.name()) {
-                            Ok(mdns) => Box::new(mdns),
-                            Err(error) => {
-                                tracing::warn!(%error, "mDNS is not available");
-                                Box::new(Silent)
-                            }
-                        };
-                    NetworkRemote::start(
-                        task_hub,
-                        settings.port,
-                        Box::new(SystemAddresses),
-                        announcer,
-                    )
-                    .await
-                })
-                .await;
-            match started {
-                Ok(Ok(network)) => {
-                    // The switch may have been turned off meanwhile.
-                    if self.settings.get().network && self.network.borrow().is_none() {
-                        let port = network.port();
-                        *self.network.borrow_mut() = Some(network);
-                        self.set_status(&format!(
-                            "Phones on this network can find Studio (port {port})."
-                        ));
-                    }
+            self.start_network(&hub, settings.port).await;
+        }
+        if settings.bluetooth && self.ble.borrow().is_none() {
+            self.start_ble(&hub).await;
+        }
+        self.notify();
+    }
+
+    async fn start_network(&self, hub: &Arc<Hub>, port: u16) {
+        let task_hub = Arc::clone(hub);
+        let started = self
+            .runtime
+            .spawn(async move {
+                let announcer: Box<dyn Announcer> =
+                    match MdnsAnnouncer::new(task_hub.identity(), task_hub.name()) {
+                        Ok(mdns) => Box::new(mdns),
+                        Err(error) => {
+                            tracing::warn!(%error, "mDNS is not available");
+                            Box::new(Silent)
+                        }
+                    };
+                NetworkRemote::start(task_hub, port, Box::new(SystemAddresses), announcer).await
+            })
+            .await;
+        let text = match started {
+            Ok(Ok(network)) => {
+                // The switch may have been turned off meanwhile.
+                if !self.settings.get().network || self.network.borrow().is_some() {
+                    return;
                 }
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "remote control cannot listen");
-                    self.set_status(&format!("Remote control cannot start: {error}"));
-                }
-                Err(_) => {}
+                let port = network.port();
+                *self.network.borrow_mut() = Some(network);
+                format!("Phones on this network can find Studio (port {port}).")
             }
-        }
-        if let Persistence::SessionOnly { .. } = self.vault.persistence()
-            && !self.status().contains("No keyring")
-        {
-            let status = format!(
-                "{} No keyring: Studio's remote control key is kept for this session only, \
-                 so phones must pair again after a restart.",
-                self.status()
-            );
-            self.set_status(status.trim_start());
-        }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "remote control cannot listen");
+                format!("The network remote cannot start: {error}")
+            }
+            Err(_) => return,
+        };
+        *self.network_status.borrow_mut() = text;
+    }
+
+    async fn start_ble(&self, hub: &Arc<Hub>) {
+        let task_hub = Arc::clone(hub);
+        let started = self
+            .runtime
+            .spawn(async move { crate::ble_remote::start(task_hub).await })
+            .await;
+        let text = match started {
+            Ok(Ok(ble)) => {
+                if !self.settings.get().bluetooth || self.ble.borrow().is_some() {
+                    return;
+                }
+                *self.ble.borrow_mut() = Some(ble);
+                "Phones nearby can find Studio over Bluetooth.".to_owned()
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "no Bluetooth remote");
+                format!("The Bluetooth remote cannot start: {error}.")
+            }
+            Err(_) => return,
+        };
+        *self.ble_status.borrow_mut() = text;
     }
 
     /// The hub, made on first use with Studio's identity from the keyring.
@@ -365,12 +392,29 @@ impl Remote {
         self.sessions.borrow().clone()
     }
 
+    /// What the dialog says about the transports.
     pub(crate) fn status(&self) -> String {
-        self.status.borrow().clone()
+        let settings = self.settings.get();
+        if !settings.network && !settings.bluetooth {
+            return "Remote control is off.".to_owned();
+        }
+        let mut parts: Vec<String> = [&self.network_status, &self.ble_status]
+            .iter()
+            .map(|s| s.borrow().clone())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if let Persistence::SessionOnly { .. } = self.vault.persistence() {
+            parts.push(
+                "No keyring: Studio's remote control key is kept for this session only, \
+                 so phones must pair again after a restart."
+                    .to_owned(),
+            );
+        }
+        parts.join(" ")
     }
 
     fn set_status(&self, text: &str) {
-        *self.status.borrow_mut() = text.to_owned();
+        *self.network_status.borrow_mut() = text.to_owned();
         self.notify();
     }
 

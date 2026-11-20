@@ -2667,8 +2667,19 @@ mod ui_check {
             "{artists}"
         );
 
+        // Bluetooth (#24) on this computer's adapter.
+        let mut both = remote.settings();
+        both.bluetooth = true;
+        remote.set(both);
+        pump(3000);
+        assert!(
+            remote.status().contains("over Bluetooth"),
+            "{}",
+            remote.status()
+        );
         let mut off = remote.settings();
         off.network = false;
+        off.bluetooth = false;
         remote.set(off);
         pump(500);
         assert_eq!(remote.status(), "Remote control is off.");

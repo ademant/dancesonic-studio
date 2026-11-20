@@ -10,10 +10,12 @@ publish.workspace = true
 
 [dependencies]
 async-channel = "2.5"
+futures-util = { version = "0.3.34", default-features = false }
 gstreamer = { version = "0.25.4", default-features = false }
 gstreamer-app = { version = "0.25.2", default-features = false }
 mpris-server = { version = "0.11.0", features = ["tokio"] }
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_22"] }
+bluer = { version = "0.17.4", default-features = false, features = ["bluetoothd"] }
 qrcode = { version = "0.15", default-features = false, features = ["std"] }
 oo7 = { version = "0.7.1", default-features = false, features = ["tokio", "native_crypto"] }
 secrecy = "0.10.3"

@@ -1,5 +1,6 @@
 //! DanceSonic Studio: the GTK4 user interface.
 
+mod ble_remote;
 mod connection_dialog;
 mod folders_dialog;
 mod mpris;

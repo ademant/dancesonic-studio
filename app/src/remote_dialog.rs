@@ -55,9 +55,9 @@ pub(crate) fn present(parent: &gtk::ApplicationWindow, remote: &Rc<Remote>) {
         .build();
     let network = gtk::CheckButton::with_label("Allow remote control on the local network");
     let bluetooth = gtk::CheckButton::with_label("Allow remote control over Bluetooth");
-    // Bluetooth comes with #24.
-    bluetooth.set_sensitive(false);
-    bluetooth.set_tooltip_text(Some("Not available yet"));
+    bluetooth.set_tooltip_text(Some(
+        "Phones find Studio over Bluetooth Low Energy, also where there is no Wi-Fi",
+    ));
     let status = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
