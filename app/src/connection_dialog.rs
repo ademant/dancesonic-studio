@@ -89,6 +89,9 @@ struct Dialog {
     /// The task that completes a confirmed pairing; cancelling aborts it.
     running: RefCell<Option<tokio::task::AbortHandle>>,
     expires_at_ms: Cell<Option<i64>>,
+    /// Set while the server field is filled from a pasted link, so its
+    /// `changed` signal does not check the paste again.
+    filling: Cell<bool>,
     /// Tells the window to open the library of the new connection.
     on_connected: Rc<dyn Fn()>,
 }
@@ -255,6 +258,7 @@ impl Dialog {
             pending: RefCell::new(None),
             running: RefCell::new(None),
             expires_at_ms: Cell::new(None),
+            filling: Cell::new(false),
             on_connected,
         });
         dialog.connect_signals();
@@ -300,11 +304,21 @@ impl Dialog {
     /// pairing link also fills in the server address; the user confirms that
     /// address with the Pair button.
     fn on_paste_changed(&self) {
+        if self.filling.get() {
+            return;
+        }
         let text = self.paste.text();
         match pairing::parse_input(&text, self.policy()) {
             Ok(input) => {
                 if let Some(server) = &input.server {
-                    self.server.set_text(&server.key());
+                    // Setting the text emits `changed` twice (after clearing
+                    // and after inserting), and each runs this check again.
+                    let key = server.key();
+                    if self.server.text() != key {
+                        self.filling.set(true);
+                        self.server.set_text(&key);
+                        self.filling.set(false);
+                    }
                 }
                 self.note.set_text(
                     "Pairing link recognised. Check the server address, then press Pair this desktop.",
@@ -614,5 +628,41 @@ impl Dialog {
                 }
             }
         });
+    }
+}
+
+/// Needs a display: `GDK_BACKEND=x11 cargo test -p dancesonic-studio
+/// connection_dialog -- --ignored`.
+#[cfg(test)]
+mod ui_check {
+    use super::*;
+    use crate::secret_service::SecretService;
+    use studio_core::db::Database;
+    use studio_core::secrets::SecretVault;
+
+    /// Regression: pasting a pairing link filled the server field, whose
+    /// `changed` signal filled it again, until the stack overflowed.
+    #[test]
+    #[ignore = "needs a display"]
+    fn pasting_a_pairing_link_fills_the_server_once() {
+        gtk::init().expect("gtk");
+        let dir = std::env::temp_dir().join(format!("studio-dialog-{}", std::process::id()));
+        let db = Arc::new(Database::open(dir.join("library.db")).expect("db"));
+        let vault = Arc::new(SecretVault::<SecretService>::session_only("dialog check"));
+        let runtime = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+        let parent = gtk::ApplicationWindow::builder().build();
+        let dialog = Dialog::new(&parent, runtime, Services { vault, db }, Rc::new(|| {}));
+
+        dialog
+            .paste
+            .set_text("tinysonic://pair?server=https%3A%2F%2Fmusic.example&token=tsp_xyz");
+        assert_eq!(dialog.server.text(), "https://music.example");
+        assert!(dialog.pair_button.is_sensitive());
+        // Editing the address runs the check again without looping; while
+        // the link is pasted, its address is the one shown.
+        dialog.server.set_text("https://other.example");
+        assert_eq!(dialog.server.text(), "https://music.example");
+        // Ignored: a leftover temp directory does no harm.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
