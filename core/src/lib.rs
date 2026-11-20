@@ -17,6 +17,7 @@ pub mod library_feed;
 pub mod pairing;
 pub mod queue;
 pub mod secrets;
+pub mod server_extras;
 pub mod sign_in;
 pub mod subsonic;
 pub mod sync;

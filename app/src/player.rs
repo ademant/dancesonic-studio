@@ -66,16 +66,15 @@ struct Inner {
     source: Option<Rc<Tracks>>,
     feeds: Feeds,
     rate: Rate,
+    /// The rate still has to be applied: a seek is refused while the pipeline
+    /// changes state, so it waits for the next async-done.
+    rate_pending: bool,
     /// The user paused. Buffering must not resume a pause the user asked for.
     user_paused: bool,
     on_event: Rc<dyn Fn(PlayerEvent)>,
 }
 
 impl Inner {
-    fn emit(&self, event: PlayerEvent) {
-        (self.on_event)(event);
-    }
-
     fn uri_for(&self, index: usize) -> Result<String, PlayerError> {
         let tracks = self.source.as_ref().ok_or(PlayerError::NoServer)?;
         let song = self
@@ -117,8 +116,6 @@ pub(crate) struct Player {
     /// The URI queued for gapless playback. The main thread writes it; the
     /// streaming thread takes it.
     prepared_next: Arc<Mutex<Option<String>>>,
-    /// Set by the streaming thread when it has switched to the prepared song.
-    switched: Arc<AtomicBool>,
     _bus_watch: gst::bus::BusWatchGuard,
 }
 
@@ -144,6 +141,7 @@ impl Player {
             source: None,
             feeds: Feeds::default(),
             rate: Rate::NORMAL,
+            rate_pending: false,
             user_paused: false,
             on_event: Rc::new(on_event),
         }));
@@ -206,6 +204,20 @@ impl Player {
                             let _ = playbin.set_state(state);
                         }
                     }
+                    gst::MessageView::AsyncDone(_) => {
+                        let pending = {
+                            let mut state = inner.borrow_mut();
+                            std::mem::take(&mut state.rate_pending).then_some(state.rate)
+                        };
+                        if let (Some(rate), Some(playbin)) = (pending, weak.upgrade()) {
+                            let position = playbin
+                                .query_position::<gst::ClockTime>()
+                                .map_or(0, gst::ClockTime::mseconds);
+                            if let Err(error) = seek_with_rate(&playbin, position, rate) {
+                                tracing::warn!(%error, "the speed could not be applied");
+                            }
+                        }
+                    }
                     gst::MessageView::Eos(_) => {
                         let emit = inner.borrow().on_event.clone();
                         emit(PlayerEvent::Finished);
@@ -226,7 +238,6 @@ impl Player {
             playbin,
             inner,
             prepared_next,
-            switched,
             _bus_watch: watch,
         })
     }
@@ -248,13 +259,9 @@ impl Player {
     }
 
     /// The queue position of the song that plays.
+    #[cfg(test)]
     pub(crate) fn current_index(&self) -> Option<usize> {
         self.inner.borrow().queue.current_index()
-    }
-
-    /// The number of songs in the queue.
-    pub(crate) fn queue_len(&self) -> usize {
-        self.inner.borrow().queue.len()
     }
 
     /// Starts the current song from the beginning and prepares the next one.
@@ -264,8 +271,13 @@ impl Player {
             let index = inner.queue.current_index().ok_or(QueueError::NoSuchIndex)?;
             (inner.uri_for(index)?, index, inner.rate)
         };
-        // A new track plays unless the user pauses it again.
-        self.inner.borrow_mut().user_paused = false;
+        // A new track plays unless the user pauses it again. Its speed is set
+        // once the pipeline is ready (async-done); a seek now would be refused.
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.user_paused = false;
+            inner.rate_pending = rate != Rate::NORMAL;
+        }
         self.playbin
             .set_state(gst::State::Null)
             .map_err(|err| PlayerError::Engine(err.to_string()))?;
@@ -276,9 +288,6 @@ impl Player {
         self.playbin
             .set_state(gst::State::Playing)
             .map_err(|err| PlayerError::Engine(err.to_string()))?;
-        if rate != Rate::NORMAL {
-            seek_with_rate(&self.playbin, 0, rate)?;
-        }
         let emit = self.inner.borrow().on_event.clone();
         emit(PlayerEvent::TrackChanged(index));
         Ok(())
@@ -349,13 +358,16 @@ impl Player {
     /// Changes the speed from here on. The pitch stays the same (`scaletempo`).
     pub(crate) fn set_rate(&mut self, rate: Rate) -> Result<(), PlayerError> {
         self.inner.borrow_mut().rate = rate;
+        if self.inner.borrow().rate_pending {
+            // The pipeline is still starting; the new rate is applied then.
+            return Ok(());
+        }
         let position = self.position_ms().map_or(0, |(p, _)| p);
-        seek_with_rate(&self.playbin, position, rate)
-    }
-
-    /// The speed the engine plays at.
-    pub(crate) fn rate(&self) -> Rate {
-        self.inner.borrow().rate
+        if seek_with_rate(&self.playbin, position, rate).is_err() {
+            // Refused while the pipeline changes state: apply it when ready.
+            self.inner.borrow_mut().rate_pending = true;
+        }
+        Ok(())
     }
 }
 

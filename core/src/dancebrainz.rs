@@ -18,6 +18,7 @@ use std::sync::Arc;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::{SONG_COLUMNS, ServerId, Song, song_from_row};
 use crate::connection::ServerUrl;
 use crate::db::{Database, DbError};
 use crate::http::{BodyError, read_body};
@@ -430,6 +431,56 @@ pub fn dances_of(conn: &Connection, mbid: &Mbid) -> Result<Vec<DanceTag>, DbErro
     Ok(tags)
 }
 
+/// The tag type of a dance, as opposed to a region or a meter.
+pub const DANCE_KIND: &str = "dance";
+
+/// The default DanceBrainz server, the one the Android app uses.
+pub const DEFAULT_SERVER: &str = "https://dancebrainz.balfolk.social/";
+
+/// One dance type in a server's library: the dance view's sidebar entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dance {
+    pub tag_id: i64,
+    pub name: String,
+    /// How many of the server's songs carry it.
+    pub songs: usize,
+}
+
+/// The dance types the songs of `server` carry, by name. Only tags of kind
+/// [`DANCE_KIND`].
+pub fn dances(conn: &Connection, server: ServerId) -> Result<Vec<Dance>, DbError> {
+    let mut select = conn.prepare_cached(
+        "SELECT t.tag_id, max(t.name), count(DISTINCT s.id)
+         FROM song s JOIN dance_tag t ON t.mbid = s.mbid
+         WHERE s.server_id = ?1 AND t.kind = ?2
+         GROUP BY t.tag_id ORDER BY max(t.name) COLLATE NOCASE, t.tag_id",
+    )?;
+    let rows = select.query_map(params![server.get(), DANCE_KIND], |row| {
+        Ok(Dance {
+            tag_id: row.get(0)?,
+            name: row.get(1)?,
+            songs: usize::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The songs of `server` tagged with the dance `tag_id`, by title.
+pub fn songs_of_dance(
+    conn: &Connection,
+    server: ServerId,
+    tag_id: i64,
+) -> Result<Vec<Song>, DbError> {
+    let sql = format!(
+        "SELECT {SONG_COLUMNS} FROM song s
+         WHERE s.server_id = ?1 AND s.mbid IN (SELECT mbid FROM dance_tag WHERE tag_id = ?2)
+         ORDER BY s.title COLLATE NOCASE, s.id"
+    );
+    let mut select = conn.prepare_cached(&sql)?;
+    let rows = select.query_map(params![server.get(), tag_id], song_from_row)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,6 +713,71 @@ mod tests {
             stale(&conn, &wanted, now + REFRESH_AFTER_MS).unwrap(),
             [mbid(A), mbid(B)]
         );
+    }
+
+    #[test]
+    fn the_dance_view_lists_dances_and_their_songs() {
+        use crate::catalog::{ChangeSet, apply_changes, ensure_server, tests::song};
+        let (_dir, db) = temp_database();
+        let server = ensure_server(&db, "https://one.example", 1).unwrap();
+        let mut songs = vec![
+            song("s1", "al1", "Ton simpl 1"),
+            song("s2", "al1", "Ton simpl 2"),
+            song("s3", "al1", "Mazurka"),
+            song("s4", "al1", "No MBID"),
+        ];
+        songs[0].mbid = Some(A.into());
+        songs[1].mbid = Some(A.into());
+        songs[2].mbid = Some(B.into());
+        let set = ChangeSet {
+            full: true,
+            server_time: 5,
+            songs,
+            ..ChangeSet::default()
+        };
+        apply_changes(&db, server, &set, 10).unwrap();
+        let tag = |tag_id, kind: &str, name: &str| DanceTag {
+            tag_id,
+            kind: kind.into(),
+            name: name.into(),
+            path: vec![name.into()],
+            qualifier: None,
+            updated_at: "x".into(),
+        };
+        let answers = [
+            RecordingDances {
+                mbid: mbid(A),
+                tags: vec![tag(41, "dance", "Ton simpl"), tag(7, "region", "Bretagne")],
+            },
+            RecordingDances {
+                mbid: mbid(B),
+                tags: vec![tag(12, "dance", "Mazurka")],
+            },
+        ];
+        db.write(|tx| store(tx, &answers, 1)).unwrap();
+        let conn = db.reader().unwrap();
+        assert_eq!(
+            dances(&conn, server).unwrap(),
+            [
+                Dance {
+                    tag_id: 12,
+                    name: "Mazurka".into(),
+                    songs: 1
+                },
+                Dance {
+                    tag_id: 41,
+                    name: "Ton simpl".into(),
+                    songs: 2
+                },
+            ]
+        );
+        let titles: Vec<String> = songs_of_dance(&conn, server, 41)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.title)
+            .collect();
+        assert_eq!(titles, ["Ton simpl 1", "Ton simpl 2"]);
+        assert!(songs_of_dance(&conn, server, 7).unwrap().len() == 2);
     }
 
     #[tokio::test]
