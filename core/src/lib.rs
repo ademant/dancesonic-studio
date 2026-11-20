@@ -15,6 +15,7 @@ pub mod dpop;
 pub mod http;
 pub mod library_feed;
 pub mod pairing;
+pub mod plays;
 pub mod queue;
 pub mod secrets;
 pub mod server_extras;

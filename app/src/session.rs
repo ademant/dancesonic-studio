@@ -12,6 +12,7 @@ use studio_core::dancebrainz::{self, Dance, DanceBrainz, Mbid};
 use studio_core::db::Database;
 use studio_core::http::{self, HttpSettings};
 use studio_core::library_feed::LibrarySource;
+use studio_core::plays::{self, Play};
 use studio_core::queue::SongId;
 use studio_core::server_extras::{ANALYSIS_EXTENSION, Waveform};
 use studio_core::subsonic::SubsonicClient;
@@ -31,6 +32,9 @@ pub(crate) struct Session {
     pub(crate) db: Arc<Database>,
     /// The server offers folksonic's analysis, so waveforms can be asked for.
     pub(crate) has_analysis: bool,
+    /// One sender of queued plays at a time, so a play is not sent twice
+    /// at once.
+    sending: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// What the sidebar lists, read in one go.
@@ -130,6 +134,7 @@ pub(crate) async fn open(services: Services) -> Result<Option<(Session, Tracks)>
             client,
             db: services.db,
             has_analysis,
+            sending: Arc::default(),
         },
         tracks,
     )))
@@ -171,6 +176,51 @@ impl Session {
                 )
             }
         })
+    }
+
+    /// Queues a play that counted (#31), then sends the queue.
+    pub(crate) async fn record_play(&self, play: Play) {
+        let db = Arc::clone(&self.db);
+        let server = self.server;
+        let queued = tokio::task::spawn_blocking(move || {
+            db.write(|tx| plays::queue_play(tx, server, &play))
+        })
+        .await;
+        match queued {
+            Ok(Ok(0)) => {}
+            Ok(Ok(dropped)) => {
+                tracing::warn!(
+                    dropped,
+                    "the play queue is full; the oldest plays were dropped"
+                );
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "a play could not be queued"),
+            Err(_) => tracing::warn!("the play queue task stopped"),
+        }
+        self.send_plays().await;
+    }
+
+    /// Sends the plays queued for this server. What fails stays queued for
+    /// the next try.
+    pub(crate) async fn send_plays(&self) {
+        let _sending = self.sending.lock().await;
+        match plays::send_queued(&self.client, Arc::clone(&self.db), self.server).await {
+            Ok(0) => {}
+            Ok(sent) => tracing::debug!(sent, "plays reported"),
+            Err(error) => tracing::info!(%error, "plays stay queued"),
+        }
+    }
+
+    /// Tells the server what is playing now. Not counted, so a failure only
+    /// means the server does not show it.
+    pub(crate) async fn now_playing(&self, song: SongId) {
+        if let Err(error) = self
+            .client
+            .scrobble(&song, studio_core::sync::now_ms(), false)
+            .await
+        {
+            tracing::debug!(%error, "now playing not reported");
+        }
     }
 
     /// Everything the sidebar lists.

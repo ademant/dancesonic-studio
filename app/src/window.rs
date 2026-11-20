@@ -15,6 +15,7 @@ use gtk::glib::BoxedAnyObject;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use studio_core::catalog::{Song, letter_of};
+use studio_core::plays::PlayCounter;
 use studio_core::queue::SongId;
 use studio_core::tempo::{MAX_RATE, MIN_RATE, Rate};
 
@@ -55,6 +56,8 @@ pub(crate) struct Window {
     request: Cell<u64>,
     /// The desktop's media controls (#7).
     mpris: Mpris,
+    /// Says when the current track has played long enough to report (#31).
+    plays: RefCell<PlayCounter>,
 }
 
 struct Sidebar {
@@ -187,6 +190,7 @@ impl Window {
             bar,
             queue: RefCell::default(),
             now_playing: Cell::new(None),
+            plays: RefCell::default(),
             playing: Cell::new(false),
             rate: Cell::new(Rate::NORMAL),
             request: Cell::new(0),
@@ -472,6 +476,11 @@ impl Window {
             });
             me.reload_catalog();
         });
+        // Plays made while offline go out now that the server answers again.
+        let Some(session) = self.session.borrow().clone() else {
+            return;
+        };
+        self.spawn(async move { session.send_plays().await }, |_, ()| {});
     }
 
     fn reload_catalog(self: &Rc<Self>) {
@@ -611,6 +620,7 @@ impl Window {
                 self.on_track_changed(song);
             }
             PlayerEvent::Finished => {
+                self.plays.borrow_mut().stop();
                 self.playing.set(false);
                 self.now_playing.set(None);
                 self.bar.now.set_text("");
@@ -672,8 +682,18 @@ impl Window {
             );
         }
         let Ok(id) = SongId::parse(&song.id) else {
+            self.plays.borrow_mut().stop();
             return;
         };
+        self.plays
+            .borrow_mut()
+            .start(id.clone(), studio_core::sync::now_ms(), song.duration_ms);
+        let reporter = session.clone();
+        let playing = id.clone();
+        self.spawn(
+            async move { reporter.now_playing(playing).await },
+            |_, ()| {},
+        );
         let expected = song.id.clone();
         self.spawn(
             async move { session.waveform(id).await },
@@ -689,7 +709,7 @@ impl Window {
         );
     }
 
-    fn tick(&self) {
+    fn tick(self: &Rc<Self>) {
         let position = self.player.borrow().as_ref().and_then(Player::position_ms);
         let Some((position, length)) = position else {
             return;
@@ -698,6 +718,10 @@ impl Window {
             .or_else(|| self.current_song().and_then(|s| s.duration_ms))
             .unwrap_or(0);
         if self.now_playing.get().is_some() {
+            let counted = self.plays.borrow_mut().position(position);
+            if let (Some(play), Some(session)) = (counted, self.session.borrow().clone()) {
+                self.spawn(async move { session.record_play(play).await }, |_, ()| {});
+            }
             self.mpris.set_position(position);
             self.bar.seek.set_position(position, length);
             self.bar
@@ -741,6 +765,7 @@ impl Window {
                 if let Some(player) = self.player.borrow().as_ref() {
                     player.stop();
                 }
+                self.plays.borrow_mut().stop();
                 self.playing.set(false);
                 self.now_playing.set(None);
                 self.bar.now.set_text("");
@@ -1643,6 +1668,7 @@ mod ui_check {
                     )),
                 )
             }
+            "/rest/scrobble.view" => (json, envelope("")),
             "/rest/getPlaylist.view" => (
                 json,
                 envelope(
@@ -1669,6 +1695,9 @@ mod ui_check {
             _ => return None,
         })
     }
+
+    /// The `scrobble` calls the fake server got, as request targets.
+    static SCROBBLES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     /// Answers the Subsonic calls above, the cover from `COVER` and the
     /// audio from `TRACK` with ranges.
@@ -1698,6 +1727,9 @@ mod ui_check {
                     let head = String::from_utf8_lossy(&head).to_string();
                     let target = head.split(' ').nth(1).unwrap_or("/").to_owned();
                     let path = target.split('?').next().unwrap_or("/").to_owned();
+                    if path == "/rest/scrobble.view" {
+                        SCROBBLES.lock().expect("scrobbles").push(target.clone());
+                    }
                     let (status, kind, body): (&str, &str, Vec<u8>) = if path == "/rest/stream.view" {
                         let start = head
                             .to_lowercase()
@@ -1911,6 +1943,18 @@ mod ui_check {
         window.play_list(0);
         pump(3000);
         assert_eq!(window.now_playing.get(), Some(0));
+        // The server hears what plays now (#31); it does not count yet.
+        let scrobbles = SCROBBLES.lock().expect("scrobbles").clone();
+        assert!(
+            scrobbles
+                .iter()
+                .any(|t| t.contains("id=so-1") && t.contains("submission=false")),
+            "{scrobbles:?}"
+        );
+        assert!(
+            !scrobbles.iter().any(|t| t.contains("submission=true")),
+            "{scrobbles:?}"
+        );
         assert!(window.bar.seek.widget.visible_child_name().as_deref() == Some("wave"));
         window.bar.bpm_mode.set_active(true);
         window.bar.speed.set_value(140.0);
