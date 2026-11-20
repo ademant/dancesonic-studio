@@ -82,6 +82,8 @@ struct Dialog {
     api_key: gtk::PasswordEntry,
     api_key_button: gtk::Button,
     sign_out_button: gtk::Button,
+    /// Sign-out also deletes this server's offline copies (#17).
+    remove_offline: gtk::CheckButton,
     spinner: gtk::Spinner,
     status: gtk::Label,
     /// A pairing waiting for the verification code to be confirmed.
@@ -169,6 +171,9 @@ impl Dialog {
             .build();
         let api_key_button = gtk::Button::with_label("Connect with API key");
         let sign_out_button = gtk::Button::with_label("Sign out of this server");
+        let remove_offline = gtk::CheckButton::builder()
+            .label("Also delete the offline copies of this server's tracks")
+            .build();
         let advanced = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(8)
@@ -223,6 +228,7 @@ impl Dialog {
         body.append(&pairing_box);
         body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         body.append(&expander);
+        body.append(&remove_offline);
         body.append(&sign_out_button);
         body.append(&footer);
         window.set_child(Some(&body));
@@ -253,6 +259,7 @@ impl Dialog {
             api_key,
             api_key_button,
             sign_out_button,
+            remove_offline,
             spinner,
             status,
             pending: RefCell::new(None),
@@ -556,7 +563,15 @@ impl Dialog {
         };
         self.set_busy(Busy::Working("Signing out…"));
         let services = self.services.clone();
+        let remove_offline = self.remove_offline.is_active();
         let task = self.runtime.spawn(async move {
+            // Copies are kept unless the user asked otherwise; they are found
+            // again after signing in to the same server.
+            let removed = if remove_offline {
+                crate::session::remove_offline(Arc::clone(&services.db), server.key()).await?
+            } else {
+                0
+            };
             let id = {
                 let db = Arc::clone(&services.db);
                 let key = server.key();
@@ -570,7 +585,13 @@ impl Dialog {
             match id {
                 Some(id) => account::sign_out(services.vault.as_ref(), Arc::clone(&services.db), id)
                     .await
-                    .map(|()| "Signed out. The server's API key stays valid until revoked on the account page.".to_owned())
+                    .map(|()| {
+                        let mut text = "Signed out. The server's API key stays valid until revoked on the account page.".to_owned();
+                        if removed > 0 {
+                            text.push_str(&format!(" {removed} offline copies were deleted."));
+                        }
+                        text
+                    })
                     .map_err(|e| e.to_string()),
                 None => Ok("This server is not connected.".to_owned()),
             }

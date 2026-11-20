@@ -1,6 +1,9 @@
 //! "Music folders" (#10): the local folders Studio reads, with a way to add
 //! one through the file chooser portal and to remove one. Removing only
 //! forgets the folder; its files stay on disk.
+//!
+//! Also the settings of offline copies (#17): their folder, the space they
+//! may take, and a check of their content.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -9,6 +12,7 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 use studio_core::db::Database;
 use studio_core::local_library::LocalFolder;
+use studio_core::offline::Settings;
 
 use crate::session;
 
@@ -20,6 +24,12 @@ struct Dialog {
     list: gtk::ListBox,
     status: gtk::Label,
     add: gtk::Button,
+    offline_folder: gtk::Label,
+    offline_used: gtk::Label,
+    limit: gtk::SpinButton,
+    /// Set while code moves `limit`, so it does not save.
+    updating: std::cell::Cell<bool>,
+    settings: std::cell::RefCell<Option<Settings>>,
     runtime: Arc<tokio::runtime::Runtime>,
     db: Arc<Database>,
     on_change: OnChange,
@@ -35,9 +45,9 @@ pub(crate) fn present(
     let window = gtk::Window::builder()
         .transient_for(parent)
         .modal(true)
-        .title("Music folders")
-        .default_width(520)
-        .default_height(360)
+        .title("Music folders and offline copies")
+        .default_width(560)
+        .default_height(520)
         .build();
     let intro = gtk::Label::builder()
         .label(
@@ -66,7 +76,53 @@ pub(crate) fn present(
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     buttons.set_halign(gtk::Align::End);
     buttons.append(&add);
-    buttons.append(&close);
+
+    // Offline copies of server tracks (#17).
+    let offline_heading = gtk::Label::builder()
+        .label("Offline copies of server tracks")
+        .css_classes(["heading"])
+        .xalign(0.0)
+        .margin_top(6)
+        .build();
+    let offline_folder = gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
+    let change = gtk::Button::with_label("Change…");
+    let reset = gtk::Button::with_label("Default");
+    reset.set_tooltip_text(Some("Use the folder under Studio's data directory"));
+    let folder_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    folder_row.append(&offline_folder);
+    folder_row.append(&change);
+    folder_row.append(&reset);
+    let limit = gtk::SpinButton::with_range(1.0, 2000.0, 1.0);
+    limit.update_property(&[gtk::accessible::Property::Label("Size limit in gigabytes")]);
+    let offline_used = gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(["dim-label"])
+        .build();
+    let check = gtk::Button::with_label("Check copies");
+    check.set_tooltip_text(Some(
+        "Read every copy and download again the ones that changed on disk",
+    ));
+    let limit_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    limit_row.append(&gtk::Label::new(Some("Use up to")));
+    limit_row.append(&limit);
+    limit_row.append(&gtk::Label::new(Some("GB")));
+    limit_row.append(&offline_used);
+    limit_row.append(&check);
+    let offline_note = gtk::Label::builder()
+        .label("Changing the folder deletes the copies in the old one; they are downloaded again.")
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .build();
+
+    let end = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    end.set_halign(gtk::Align::End);
+    end.append(&close);
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -77,8 +133,14 @@ pub(crate) fn present(
         .build();
     body.append(&intro);
     body.append(&scroll);
-    body.append(&status);
     body.append(&buttons);
+    body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    body.append(&offline_heading);
+    body.append(&folder_row);
+    body.append(&limit_row);
+    body.append(&offline_note);
+    body.append(&status);
+    body.append(&end);
     window.set_child(Some(&body));
 
     let dialog = Rc::new(Dialog {
@@ -86,6 +148,11 @@ pub(crate) fn present(
         list,
         status,
         add,
+        offline_folder,
+        offline_used,
+        limit,
+        updating: std::cell::Cell::new(false),
+        settings: std::cell::RefCell::default(),
         runtime: Arc::clone(runtime),
         db,
         on_change,
@@ -102,6 +169,57 @@ pub(crate) fn present(
             }
         });
     }
+    {
+        let weak = Rc::downgrade(&dialog);
+        change.connect_clicked(move |_| {
+            if let Some(dialog) = weak.upgrade() {
+                dialog.choose_offline_folder();
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(&dialog);
+        reset.connect_clicked(move |_| {
+            if let Some(dialog) = weak.upgrade() {
+                dialog.save_offline(|s| s.folder = None);
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(&dialog);
+        dialog.limit.connect_value_changed(move |spin| {
+            let Some(dialog) = weak.upgrade() else { return };
+            if dialog.updating.get() {
+                return;
+            }
+            let bytes = (spin.value().max(1.0) * 1e9) as u64;
+            dialog.save_offline(move |s| s.limit_bytes = bytes);
+        });
+    }
+    {
+        let weak = Rc::downgrade(&dialog);
+        check.connect_clicked(move |button| {
+            let Some(dialog) = weak.upgrade() else { return };
+            button.set_sensitive(false);
+            dialog.status.set_text("Checking the offline copies…");
+            let button = button.clone();
+            dialog.spawn(
+                session::verify_offline(Arc::clone(&dialog.db)),
+                move |me, result| {
+                    button.set_sensitive(true);
+                    me.status.set_text(&match result {
+                        Ok((checked, 0)) => format!("All {checked} offline copies are intact."),
+                        Ok((checked, broken)) => format!(
+                            "{broken} of {checked} offline copies had changed; they are downloaded again."
+                        ),
+                        Err(error) => format!("The copies could not be checked: {error}"),
+                    });
+                    me.refresh_offline();
+                    (me.on_change)();
+                },
+            );
+        });
+    }
     // The window holds the dialog state until it closes.
     {
         let keep = std::cell::RefCell::new(Some(Rc::clone(&dialog)));
@@ -110,6 +228,7 @@ pub(crate) fn present(
         });
     }
     dialog.refresh();
+    dialog.refresh_offline();
     dialog.window.present();
 }
 
@@ -207,6 +326,71 @@ impl Dialog {
                     return;
                 };
                 me.add(path);
+            },
+        );
+    }
+
+    fn refresh_offline(self: &Rc<Self>) {
+        self.spawn(
+            session::offline_status(Arc::clone(&self.db)),
+            |me, status| match status {
+                Ok((settings, dir, used)) => {
+                    me.offline_folder.set_text(&dir.display().to_string());
+                    me.offline_folder
+                        .set_tooltip_text(Some(&dir.display().to_string()));
+                    me.updating.set(true);
+                    me.limit
+                        .set_value((settings.limit_bytes as f64 / 1e9).round());
+                    me.updating.set(false);
+                    me.offline_used
+                        .set_text(&format!("{} MB used", used / 1_000_000));
+                    *me.settings.borrow_mut() = Some(settings);
+                }
+                Err(error) => me
+                    .status
+                    .set_text(&format!("The offline settings could not be read: {error}")),
+            },
+        );
+    }
+
+    /// Saves the offline settings with `change` applied.
+    fn save_offline(self: &Rc<Self>, change: impl FnOnce(&mut Settings)) {
+        let Some(mut settings) = self.settings.borrow().clone() else {
+            return;
+        };
+        change(&mut settings);
+        self.spawn(
+            session::set_offline_settings(Arc::clone(&self.db), settings),
+            |me, result| {
+                if let Err(error) = result {
+                    me.status
+                        .set_text(&format!("The offline settings could not be saved: {error}"));
+                }
+                me.refresh_offline();
+                (me.on_change)();
+            },
+        );
+    }
+
+    fn choose_offline_folder(self: &Rc<Self>) {
+        let chooser = gtk::FileDialog::builder()
+            .title("Folder for offline copies")
+            .modal(true)
+            .build();
+        let weak = Rc::downgrade(self);
+        chooser.select_folder(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let (Some(me), Ok(file)) = (weak.upgrade(), result) else {
+                    return;
+                };
+                match file.path() {
+                    Some(path) => me.save_offline(move |s| s.folder = Some(path)),
+                    None => me
+                        .status
+                        .set_text("Only folders on this computer can be used."),
+                }
             },
         );
     }

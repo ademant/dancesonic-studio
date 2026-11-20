@@ -13,6 +13,7 @@ use studio_core::db::Database;
 use studio_core::http::{self, HttpSettings};
 use studio_core::library_feed::LibrarySource;
 use studio_core::local_library::{self, LocalArtist, LocalFilter, LocalFolder, ScanReport};
+use studio_core::offline::{self, PinKind};
 use studio_core::plays::{self, Play};
 use studio_core::queue::SongId;
 use studio_core::server_extras::{ANALYSIS_EXTENSION, Waveform};
@@ -36,6 +37,10 @@ pub(crate) struct Session {
     /// One sender of queued plays at a time, so a play is not sent twice
     /// at once.
     sending: Arc<tokio::sync::Mutex<()>>,
+    /// Where offline copies are downloaded from (#17).
+    offline: offline::Source,
+    /// One offline sync at a time.
+    keeping: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// What the sidebar lists, read in one go.
@@ -103,6 +108,11 @@ pub(crate) async fn open(services: Services) -> Result<Option<(Session, Tracks)>
     let http = http::client(&settings).map_err(|e| e.to_string())?;
     let streaming = http::streaming_client(&settings).map_err(|e| e.to_string())?;
     let client = SubsonicClient::new(http, url.clone(), auth.clone());
+    let offline = offline::Source {
+        http: streaming.clone(),
+        server: url.clone(),
+        auth: auth.clone(),
+    };
 
     let cache_dir = gtk::glib::user_cache_dir()
         .join("dancesonic-studio")
@@ -145,6 +155,8 @@ pub(crate) async fn open(services: Services) -> Result<Option<(Session, Tracks)>
             db: services.db,
             has_analysis,
             sending: Arc::default(),
+            offline,
+            keeping: Arc::default(),
         },
         tracks,
     )))
@@ -233,6 +245,61 @@ impl Session {
         }
     }
 
+    /// Whether an album or playlist is kept offline (#17).
+    pub(crate) async fn pinned(&self, kind: PinKind, item: String) -> bool {
+        let db = Arc::clone(&self.db);
+        let base_url = self.client.server().key();
+        tokio::task::spawn_blocking(move || {
+            db.reader()
+                .ok()
+                .and_then(|conn| offline::is_pinned(&conn, &base_url, kind, &item).ok())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Marks an album or playlist "keep offline", or not, then brings the
+    /// copies in line.
+    pub(crate) async fn set_pinned(
+        &self,
+        kind: PinKind,
+        item: String,
+        pinned: bool,
+    ) -> Result<offline::SyncReport, String> {
+        let db = Arc::clone(&self.db);
+        let base_url = self.client.server().key();
+        tokio::task::spawn_blocking(move || {
+            offline::set_pinned(&db, &base_url, kind, &item, pinned, sync::now_ms())
+        })
+        .await
+        .map_err(|_| "The library task stopped.".to_owned())?
+        .map_err(|e| e.to_string())?;
+        self.sync_offline().await
+    }
+
+    /// Downloads what pinned albums and playlists hold and removes copies no
+    /// longer wanted, within the size limit.
+    pub(crate) async fn sync_offline(&self) -> Result<offline::SyncReport, String> {
+        let _keeping = self.keeping.lock().await;
+        let db = Arc::clone(&self.db);
+        let (dir, limit) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let conn = db.reader().map_err(|e| e.to_string())?;
+            let settings = offline::settings(&conn).map_err(|e| e.to_string())?;
+            let dir = offline::store_dir(&offline_root(), &settings);
+            // Leftovers of a stopped download.
+            if let Err(error) = offline::clean_up(&db, &dir) {
+                tracing::debug!(%error, "offline folder not cleaned");
+            }
+            Ok((dir, settings.limit_bytes))
+        })
+        .await
+        .map_err(|_| "The library task stopped.".to_owned())??;
+        offline::sync(&self.offline, Arc::clone(&self.db), self.server, dir, limit)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Everything the sidebar lists.
     pub(crate) async fn catalog(&self) -> Result<Catalog, String> {
         let db = Arc::clone(&self.db);
@@ -257,6 +324,7 @@ impl Session {
     pub(crate) async fn songs(&self, selection: Selection) -> Result<Vec<Song>, String> {
         let db = Arc::clone(&self.db);
         let server = self.server;
+        let base_url = self.client.server().key();
         tokio::task::spawn_blocking(move || {
             let conn = db.reader().map_err(|e| e.to_string())?;
             let local = |filter: LocalFilter| {
@@ -295,8 +363,12 @@ impl Session {
                     songs
                 }
             };
-            // Every song with a local file plays from disk (#10).
+            // Every song with a local file plays from disk (#10), and so does
+            // every song kept offline (#17).
             local_library::resolve_paths(&conn, &mut songs).map_err(|e| e.to_string())?;
+            let dir = offline::current_dir(&conn, &offline_root()).map_err(|e| e.to_string())?;
+            offline::resolve_paths(&conn, &dir, &base_url, &mut songs)
+                .map_err(|e| e.to_string())?;
             Ok(songs)
         })
         .await
@@ -391,6 +463,62 @@ impl Session {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+/// The default folder of offline copies (#17).
+pub(crate) fn offline_root() -> std::path::PathBuf {
+    gtk::glib::user_data_dir()
+        .join("dancesonic-studio")
+        .join("offline")
+}
+
+/// The offline settings, the folder in use and the space used by all copies.
+pub(crate) async fn offline_status(
+    db: Arc<Database>,
+) -> Result<(offline::Settings, std::path::PathBuf, u64), String> {
+    tokio::task::spawn_blocking(move || {
+        let conn = db.reader().map_err(|e| e.to_string())?;
+        let settings = offline::settings(&conn).map_err(|e| e.to_string())?;
+        let dir = offline::store_dir(&offline_root(), &settings);
+        let used = offline::used_bytes(&conn, None).map_err(|e| e.to_string())?;
+        Ok((settings, dir, used))
+    })
+    .await
+    .map_err(|_| "The library task stopped.".to_owned())?
+}
+
+/// Changes where offline copies live and how much space they may take.
+pub(crate) async fn set_offline_settings(
+    db: Arc<Database>,
+    settings: offline::Settings,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        offline::set_settings(&db, &offline_root(), &settings).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "The library task stopped.".to_owned())?
+}
+
+/// Checks every offline copy against its recorded SHA-256.
+pub(crate) async fn verify_offline(db: Arc<Database>) -> Result<(usize, usize), String> {
+    tokio::task::spawn_blocking(move || {
+        let conn = db.reader().map_err(|e| e.to_string())?;
+        let dir = offline::current_dir(&conn, &offline_root()).map_err(|e| e.to_string())?;
+        offline::verify(&db, &dir, None).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "The check stopped.".to_owned())?
+}
+
+/// Deletes the offline copies and pins of a server, for a sign-out.
+pub(crate) async fn remove_offline(db: Arc<Database>, base_url: String) -> Result<usize, String> {
+    tokio::task::spawn_blocking(move || {
+        let conn = db.reader().map_err(|e| e.to_string())?;
+        let dir = offline::current_dir(&conn, &offline_root()).map_err(|e| e.to_string())?;
+        offline::remove_server(&db, &dir, &base_url).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "The library task stopped.".to_owned())?
 }
 
 /// The local folders (#10).

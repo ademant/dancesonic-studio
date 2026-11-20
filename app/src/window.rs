@@ -16,6 +16,7 @@ use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use studio_core::catalog::{Song, letter_of};
 use studio_core::local_library::FolderWatcher;
+use studio_core::offline::PinKind;
 use studio_core::plays::PlayCounter;
 use studio_core::queue::SongId;
 use studio_core::tempo::{MAX_RATE, MIN_RATE, Rate};
@@ -81,6 +82,12 @@ struct TrackList {
     sorted: gtk::SortListModel,
     selection: gtk::SingleSelection,
     title: gtk::Label,
+    /// "Keep offline" for the album or playlist shown (#17).
+    keep: gtk::CheckButton,
+    /// Set while code changes `keep`, so it does not pin.
+    updating: Cell<bool>,
+    /// What the list shows, with its title.
+    shown: RefCell<Option<(String, Selection)>>,
 }
 
 struct Detail {
@@ -374,7 +381,70 @@ impl Window {
             }
         });
 
+        let weak = Rc::downgrade(self);
+        self.tracks.keep.connect_toggled(move |check| {
+            let Some(me) = weak.upgrade() else { return };
+            if !me.tracks.updating.get() {
+                me.set_kept_offline(check.is_active());
+            }
+        });
+
         self.connect_player_bar();
+    }
+
+    /// Pins or unpins the album or playlist shown, then updates the copies.
+    fn set_kept_offline(self: &Rc<Self>, keep: bool) {
+        let Some(session) = self.session.borrow().clone() else {
+            return;
+        };
+        let Some((title, selection)) = self.tracks.shown.borrow().clone() else {
+            return;
+        };
+        let Some((kind, item)) = pin_of(&selection) else {
+            return;
+        };
+        self.status.set_text(if keep {
+            "Downloading for offline use…"
+        } else {
+            "Removing offline copies…"
+        });
+        self.spawn(
+            async move { session.set_pinned(kind, item, keep).await },
+            move |me, result| {
+                me.show_offline_result(result);
+                let current = me.tracks.shown.borrow().clone();
+                if current.as_ref().is_some_and(|(_, s)| *s == selection) {
+                    me.show_songs(title, selection);
+                }
+            },
+        );
+    }
+
+    fn show_offline_result(&self, result: Result<studio_core::offline::SyncReport, String>) {
+        self.status.set_text(&match result {
+            Ok(report) => {
+                let mut text = format!(
+                    "Offline: {} downloaded, {} removed, {} MB used.",
+                    report.downloaded,
+                    report.removed,
+                    report.used_bytes / 1_000_000
+                );
+                if report.over_limit > 0 {
+                    text.push_str(&format!(
+                        " {} tracks do not fit within the size limit.",
+                        report.over_limit
+                    ));
+                }
+                if report.failed > 0 {
+                    text.push_str(&format!(
+                        " {} could not be downloaded; the next update tries again.",
+                        report.failed
+                    ));
+                }
+                text
+            }
+            Err(error) => format!("Offline copies could not be updated: {error}"),
+        });
     }
 
     fn connect_player_bar(self: &Rc<Self>) {
@@ -496,9 +566,20 @@ impl Window {
                 if let Some(me) = weak.upgrade() {
                     me.reload_catalog();
                     me.watch_folders();
+                    me.keep_offline();
                 }
             }),
         );
+    }
+
+    /// Brings the offline copies in line with the pins and the settings.
+    fn keep_offline(self: &Rc<Self>) {
+        let Some(session) = self.session.borrow().clone() else {
+            return;
+        };
+        self.spawn(async move { session.sync_offline().await }, |me, result| {
+            me.show_offline_result(result);
+        });
     }
 
     /// Scans the folders once for what changed while Studio was closed, and
@@ -573,11 +654,24 @@ impl Window {
         };
         self.status.set_text("Updating the library…");
         self.spawn(async move { session.sync().await }, |me, result| {
+            let synced = result.is_ok();
             me.status.set_text(&match result {
                 Ok(text) => text,
                 Err(error) => format!("The library could not be updated: {error}"),
             });
             me.reload_catalog();
+            // Pinned albums and playlists may have changed (#17).
+            if synced && let Some(session) = me.session.borrow().clone() {
+                me.spawn(async move { session.sync_offline().await }, |me, result| {
+                    if let Ok(report) = &result
+                        && report.downloaded + report.removed + report.failed + report.over_limit
+                            == 0
+                    {
+                        return;
+                    }
+                    me.show_offline_result(result);
+                });
+            }
         });
         // Plays made while offline go out now that the server answers again.
         let Some(session) = self.session.borrow().clone() else {
@@ -641,6 +735,22 @@ impl Window {
         };
         let request = self.request.get() + 1;
         self.request.set(request);
+        *self.tracks.shown.borrow_mut() = Some((title.clone(), selection.clone()));
+        self.tracks.keep.set_visible(false);
+        if let Some((kind, item)) = pin_of(&selection) {
+            let reader = session.clone();
+            self.spawn(
+                async move { reader.pinned(kind, item).await },
+                move |me, on| {
+                    if me.request.get() == request {
+                        me.tracks.updating.set(true);
+                        me.tracks.keep.set_active(on);
+                        me.tracks.updating.set(false);
+                        me.tracks.keep.set_visible(true);
+                    }
+                },
+            );
+        }
         self.spawn(
             async move { session.songs(selection).await },
             move |me, result| {
@@ -1285,9 +1395,19 @@ fn lettered(entries: impl Iterator<Item = (String, Rc<Node>)>) -> Vec<Rc<Node>> 
 /// Where a song can be played from (#10).
 fn location(song: &Song) -> &'static str {
     match (song.on_server, song.local_path.is_some()) {
+        (true, true) if song.kept_offline => "Offline",
         (true, true) => "Both",
         (true, false) => "Server",
         (false, _) => "Local",
+    }
+}
+
+/// The album or playlist a selection keeps offline (#17).
+fn pin_of(selection: &Selection) -> Option<(PinKind, String)> {
+    match selection {
+        Selection::Album(id) => Some((PinKind::Album, id.clone())),
+        Selection::Playlist(id) => Some((PinKind::Playlist, id.clone())),
+        _ => None,
     }
 }
 
@@ -1440,8 +1560,18 @@ impl TrackList {
             .vexpand(true)
             .hexpand(true)
             .build();
+        title.set_hexpand(true);
+        let keep = gtk::CheckButton::builder()
+            .label("Keep offline")
+            .tooltip_text("Download these tracks so they play without the server")
+            .visible(false)
+            .margin_end(12)
+            .build();
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        head.append(&title);
+        head.append(&keep);
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.append(&title);
+        widget.append(&head);
         widget.append(&scroll);
         Self {
             widget,
@@ -1450,6 +1580,9 @@ impl TrackList {
             sorted,
             selection,
             title,
+            keep,
+            updating: Cell::new(false),
+            shown: RefCell::default(),
         }
     }
 }
@@ -1954,7 +2087,9 @@ mod ui_check {
                     if path == "/rest/scrobble.view" {
                         SCROBBLES.lock().expect("scrobbles").push(target.clone());
                     }
-                    let (status, kind, body): (&str, &str, Vec<u8>) = if path == "/rest/stream.view" {
+                    let (status, kind, body): (&str, &str, Vec<u8>) = if path == "/rest/stream.view"
+                        || path == "/rest/download.view"
+                    {
                         let start = head
                             .to_lowercase()
                             .lines()
@@ -2006,7 +2141,12 @@ mod ui_check {
             f64::from(widget.width()),
             f64::from(widget.height()),
         );
-        let node = snapshot.to_node().expect("something drawn");
+        // The window is on the user's display; while it is not drawn (for
+        // example on another workspace) there is no picture to save.
+        let Some(node) = snapshot.to_node() else {
+            eprintln!("SHOT skipped, nothing drawn: {}", path.display());
+            return;
+        };
         let renderer = widget
             .native()
             .and_then(|n| n.renderer())
@@ -2152,6 +2292,19 @@ mod ui_check {
         );
         let folder = studio_core::local_library::add_folder(&db, &music, now).expect("folder");
         studio_core::local_library::scan_folder(&db, &folder, now).expect("scan");
+        // Offline copies (#17) go to the scratch folder, not the user's data.
+        let kept = shots.join("kept");
+        let _ = std::fs::remove_dir_all(&kept);
+        std::fs::create_dir_all(&kept).expect("kept");
+        studio_core::offline::set_settings(
+            &db,
+            &kept,
+            &studio_core::offline::Settings {
+                folder: Some(kept.clone()),
+                limit_bytes: 1_000_000_000,
+            },
+        )
+        .expect("offline settings");
 
         gtk::init().expect("gtk");
         let app = gtk::Application::builder()
@@ -2343,6 +2496,43 @@ mod ui_check {
             "a local-only track is not reported: {scrobbles:?}"
         );
         save(window.window.upcast_ref(), &shots.join("5-local.png"));
+
+        // Keep an album offline (#17): Scottish is downloaded; Mazurka
+        // already plays from the music folder.
+        window.show_songs("Bal folk".into(), Selection::Album("al-2".into()));
+        pump(800);
+        assert!(window.tracks.keep.is_visible() && !window.tracks.keep.is_active());
+        window.tracks.keep.set_active(true);
+        pump(4000);
+        let shown: Vec<(String, &str)> = (0..window.tracks.sorted.n_items())
+            .filter_map(|i| {
+                window
+                    .tracks
+                    .sorted
+                    .item(i)
+                    .and_downcast::<BoxedAnyObject>()
+            })
+            .map(|o| {
+                let song = o.borrow::<Song>();
+                (song.id.clone(), location(&song))
+            })
+            .collect();
+        assert!(shown.contains(&("so-4".to_owned(), "Offline")), "{shown:?}");
+        assert!(shown.contains(&("so-3".to_owned(), "Both")), "{shown:?}");
+        // Both songs of the album are kept, also the one in a music folder,
+        // which may be on a drive that is not always there.
+        let stored: Vec<String> = std::fs::read_dir(kept.join(studio_core::offline::FOLDER_NAME))
+            .expect("offline folder")
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+        assert_eq!(stored.len(), 2, "{stored:?}");
+        assert!(
+            stored
+                .iter()
+                .all(|n| n.len() == 70 && n.ends_with(".audio")),
+            "named by a hash: {stored:?}"
+        );
+        save(window.window.upcast_ref(), &shots.join("6-offline.png"));
         window.window.destroy();
         pump(300);
     }

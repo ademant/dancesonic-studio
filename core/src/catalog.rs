@@ -79,6 +79,8 @@ pub struct Song {
     /// Its file, checked to be inside its folder; filled in by
     /// [`crate::local_library::resolve_paths`].
     pub local_path: Option<std::path::PathBuf>,
+    /// `local_path` is an offline copy of the server's file (#17).
+    pub kept_offline: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -556,6 +558,7 @@ pub(crate) fn song_from_row(r: &Row<'_>) -> rusqlite::Result<Song> {
         on_server: true,
         local_id: r.get(20)?,
         local_path: None,
+        kept_offline: false,
     })
 }
 

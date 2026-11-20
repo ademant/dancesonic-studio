@@ -15,6 +15,7 @@ pub mod dpop;
 pub mod http;
 pub mod library_feed;
 pub mod local_library;
+pub mod offline;
 pub mod pairing;
 pub mod plays;
 pub mod queue;

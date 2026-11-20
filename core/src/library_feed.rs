@@ -381,6 +381,7 @@ fn song_from(item: SongItem) -> Song {
         on_server: true,
         local_id: None,
         local_path: None,
+        kept_offline: false,
     }
 }
 

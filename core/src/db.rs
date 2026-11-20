@@ -27,6 +27,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0003_audio_cache.sql"),
     include_str!("migrations/0004_play_queue.sql"),
     include_str!("migrations/0005_local_library.sql"),
+    include_str!("migrations/0006_offline.sql"),
 ];
 
 /// The schema version this build creates and understands.
@@ -429,6 +430,57 @@ pub(crate) mod tests {
             .query_row("SELECT count(*) FROM audio_cache", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0, "cache rows go with their server");
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    /// Step 5 → 6 keeps the local library and adds offline copies, with the
+    /// default settings row; copy file names can only be hash-shaped.
+    #[test]
+    fn migration_5_to_6_keeps_rows_and_adds_offline_copies() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 5).unwrap();
+        conn.execute_batch(
+            "INSERT INTO local_folder (id, path, added_at) VALUES (1, '/music', 1);",
+        )
+        .unwrap();
+        migrate_to(&mut conn, 6).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 6);
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM local_folder", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
+        let limit: i64 = conn
+            .query_row("SELECT limit_bytes FROM offline_settings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, 10 * 1024 * 1024 * 1024);
+        let insert = |name: &str| {
+            conn.execute(
+                "INSERT INTO offline_track (base_url, song_id, file_name, size_bytes, sha256,
+                     stored_at) VALUES ('https://music.example', ?1, ?1, 1, ?2, 1)",
+                rusqlite::params![name, "0".repeat(64)],
+            )
+        };
+        insert(&format!("{}.audio", "a".repeat(64))).unwrap();
+        assert!(
+            insert("../../etc/passwd").is_err(),
+            "only hash-shaped names"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO offline_settings (id, limit_bytes) VALUES (2, 1)",
+                []
+            )
+            .is_err(),
+            "one settings row"
+        );
         assert!(
             conn.prepare("PRAGMA foreign_key_check")
                 .unwrap()
