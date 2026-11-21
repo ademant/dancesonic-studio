@@ -39,6 +39,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tracing = "0.1.44"
 url = "2.5.8"
+rustls-platform-verifier = "0.7"
 
 [lints]
 workspace = true

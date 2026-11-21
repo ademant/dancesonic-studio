@@ -33,10 +33,21 @@ pub(crate) fn present(
     runtime: &Arc<tokio::runtime::Runtime>,
     services: Services,
     on_connected: Rc<dyn Fn()>,
+    before_sign_out: BeforeSignOut,
 ) {
-    let dialog = Dialog::new(parent, Arc::clone(runtime), services, on_connected);
+    let dialog = Dialog::new(
+        parent,
+        Arc::clone(runtime),
+        services,
+        on_connected,
+        before_sign_out,
+    );
     dialog.window.present();
 }
+
+/// Called with the server's key before signing out of it; the returned work
+/// runs before the credentials are deleted (the relay record, #38).
+pub(crate) type BeforeSignOut = Rc<dyn Fn(&str) -> Option<crate::remote::Pending>>;
 
 /// The settings for one HTTP client, from the warned opt-in checkbox.
 fn settings(policy: HttpPolicy) -> HttpSettings {
@@ -96,6 +107,7 @@ struct Dialog {
     filling: Cell<bool>,
     /// Tells the window to open the library of the new connection.
     on_connected: Rc<dyn Fn()>,
+    before_sign_out: BeforeSignOut,
 }
 
 impl Dialog {
@@ -104,6 +116,7 @@ impl Dialog {
         runtime: Arc<tokio::runtime::Runtime>,
         services: Services,
         on_connected: Rc<dyn Fn()>,
+        before_sign_out: BeforeSignOut,
     ) -> Rc<Self> {
         let window = gtk::Window::builder()
             .transient_for(parent)
@@ -267,6 +280,7 @@ impl Dialog {
             expires_at_ms: Cell::new(None),
             filling: Cell::new(false),
             on_connected,
+            before_sign_out,
         });
         dialog.connect_signals();
         dialog
@@ -564,7 +578,12 @@ impl Dialog {
         self.set_busy(Busy::Working("Signing out…"));
         let services = self.services.clone();
         let remove_offline = self.remove_offline.is_active();
+        let withdraw = (self.before_sign_out)(&server.key());
         let task = self.runtime.spawn(async move {
+            // While the key still works: Studio's relay record goes first.
+            if let Some(withdraw) = withdraw {
+                withdraw.await;
+            }
             // Copies are kept unless the user asked otherwise; they are found
             // again after signing in to the same server.
             let removed = if remove_offline {
@@ -672,7 +691,13 @@ mod ui_check {
         let vault = Arc::new(SecretVault::<SecretService>::session_only("dialog check"));
         let runtime = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
         let parent = gtk::ApplicationWindow::builder().build();
-        let dialog = Dialog::new(&parent, runtime, Services { vault, db }, Rc::new(|| {}));
+        let dialog = Dialog::new(
+            &parent,
+            runtime,
+            Services { vault, db },
+            Rc::new(|| {}),
+            Rc::new(|_| None),
+        );
 
         dialog
             .paste

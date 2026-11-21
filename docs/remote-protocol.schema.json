@@ -5,6 +5,7 @@
   "description": "Every message between the phone and Studio. See remote-protocol.md.",
   "oneOf": [
     { "$ref": "#/$defs/pair_request" },
+    { "$ref": "#/$defs/pair_code_request" },
     { "$ref": "#/$defs/hello" },
     { "$ref": "#/$defs/command" },
     { "$ref": "#/$defs/identity" },
@@ -35,6 +36,20 @@
         "device_key": { "$ref": "#/$defs/b64u", "description": "65-byte uncompressed SEC1 P-256 point" },
         "noise_key": { "$ref": "#/$defs/b64u", "description": "32-byte X25519 public key" },
         "proof": { "$ref": "#/$defs/b64u", "description": "HMAC-SHA256(secret, T)" },
+        "sig": { "$ref": "#/$defs/b64u", "description": "DER ECDSA P-256 signature of T" }
+      }
+    },
+    "pair_code_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "v", "name", "device_key", "noise_key", "sig"],
+      "description": "Pairing through folksonic's relay, confirmed by comparing codes",
+      "properties": {
+        "type": { "const": "pair_code_request" },
+        "v": { "const": 1 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "device_key": { "$ref": "#/$defs/b64u", "description": "65-byte uncompressed SEC1 P-256 point" },
+        "noise_key": { "$ref": "#/$defs/b64u", "description": "32-byte X25519 public key of this session" },
         "sig": { "$ref": "#/$defs/b64u", "description": "DER ECDSA P-256 signature of T" }
       }
     },
@@ -179,7 +194,7 @@
         "type": { "const": "welcome" },
         "protocol": { "const": 1 },
         "name": { "type": "string", "maxLength": 64 },
-        "transport": { "enum": ["ble", "network"] },
+        "transport": { "enum": ["ble", "relay", "network"] },
         "features": {
           "type": "array",
           "items": { "enum": ["playback", "tempo", "dance", "queue", "library", "cover", "network_hint"] }

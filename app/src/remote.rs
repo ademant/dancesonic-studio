@@ -1,21 +1,26 @@
-//! Remote control by the DanceSonic phone app (#20, #24): the switches,
+//! Remote control by the DanceSonic phone app (#20, #24, #38): the switches,
 //! Studio's identity, the hub and its transports, and the user's decisions.
 //! The protocol itself is in `studio_core::remote`.
 
 use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gtk::glib;
 use secrecy::SecretString;
 use studio_core::db::Database;
+use studio_core::http::HttpSettings;
 use studio_core::remote::devices::{self, Device, DeviceId};
 use studio_core::remote::hub::{Hub, HubEvent, Reply, SystemClock};
 use studio_core::remote::identity;
 use studio_core::remote::messages::{Command, PlayState, Transport};
 use studio_core::remote::network::{Announcer, MdnsAnnouncer, NetworkRemote, SystemAddresses};
+use studio_core::remote::relay::{RelayError, RelayRemote, RelayStatus};
 use studio_core::remote::settings::{self, Settings};
 use studio_core::secrets::{Persistence, SecretVault};
+use studio_core::subsonic::SubsonicClient;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::ble_remote::BleRemote;
@@ -33,6 +38,17 @@ pub(crate) struct Connected {
     pub(crate) device: DeviceId,
     pub(crate) name: String,
     pub(crate) transport: Transport,
+}
+
+/// Work that must finish before the caller goes on (withdrawing the relay
+/// record before sign-out deletes the key).
+pub(crate) type Pending = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// The server the relay goes through: the signed-in session's client.
+#[derive(Clone)]
+pub(crate) struct RelayServer {
+    pub(crate) client: SubsonicClient,
+    pub(crate) http: HttpSettings,
 }
 
 /// Announces nothing: used when mDNS cannot start. Phones then find Studio
@@ -54,10 +70,17 @@ pub(crate) struct Remote {
     hub: RefCell<Option<Arc<Hub>>>,
     network: RefCell<Option<NetworkRemote>>,
     ble: RefCell<Option<BleRemote>>,
+    /// The signed-in server, if any; the relay needs one.
+    server: RefCell<Option<RelayServer>>,
+    relay: RefCell<Option<RelayRemote>>,
+    /// Bumped when the relay is stopped, so a start that finishes later is
+    /// thrown away.
+    relay_generation: Cell<u64>,
     sessions: RefCell<Vec<Connected>>,
     /// What the network transport, Bluetooth and the keyring say.
     network_status: RefCell<String>,
     ble_status: RefCell<String>,
+    relay_status: RefCell<String>,
     listeners: RefCell<Vec<(u64, Listener)>>,
     next_listener: Cell<u64>,
 }
@@ -79,14 +102,19 @@ impl Remote {
             settings: Cell::new(Settings {
                 network: false,
                 bluetooth: false,
+                relay: false,
                 port: studio_core::remote::network::DEFAULT_PORT,
             }),
             hub: RefCell::new(None),
             network: RefCell::new(None),
             ble: RefCell::new(None),
+            server: RefCell::new(None),
+            relay: RefCell::new(None),
+            relay_generation: Cell::new(0),
             sessions: RefCell::new(Vec::new()),
             network_status: RefCell::new(String::new()),
             ble_status: RefCell::new(String::new()),
+            relay_status: RefCell::new(String::new()),
             listeners: RefCell::new(Vec::new()),
             next_listener: Cell::new(0),
         })
@@ -146,11 +174,28 @@ impl Remote {
             self.ble.borrow_mut().take();
             self.ble_status.borrow_mut().clear();
         }
-        if !settings.network && !settings.bluetooth {
+        if !settings.relay || self.server.borrow().is_none() {
+            // Withdraws the record in the background.
+            if let Some(pending) = self.stop_relay() {
+                self.runtime.spawn(pending);
+            }
+        }
+        if !settings.network && !settings.bluetooth && !settings.relay {
             self.notify();
             return;
         }
         let Some(hub) = self.hub().await else { return };
+        if settings.relay && self.relay.borrow().is_none() {
+            let server = self.server.borrow().clone();
+            match server {
+                Some(server) => self.start_relay(&hub, server).await,
+                None => {
+                    *self.relay_status.borrow_mut() =
+                        "Remote control through folksonic starts when Studio is signed in to a server."
+                            .to_owned();
+                }
+            }
+        }
         if settings.network && self.network.borrow().is_none() {
             self.start_network(&hub, settings.port).await;
         }
@@ -218,6 +263,117 @@ impl Remote {
         *self.ble_status.borrow_mut() = text;
     }
 
+    async fn start_relay(self: &Rc<Self>, hub: &Arc<Hub>, server: RelayServer) {
+        let generation = self.relay_generation.get();
+        let task_hub = Arc::clone(hub);
+        let started = self
+            .runtime
+            .spawn(async move { RelayRemote::start(task_hub, server.client, server.http).await })
+            .await;
+        let text = match started {
+            Ok(Ok(relay)) => {
+                let stale = generation != self.relay_generation.get()
+                    || !self.settings.get().relay
+                    || self.relay.borrow().is_some();
+                if stale {
+                    // Withdraw what this late start published.
+                    self.runtime.spawn(async move {
+                        if let Err(error) = relay.stop().await {
+                            tracing::warn!(%error, "relay record not withdrawn");
+                        }
+                    });
+                    return;
+                }
+                self.watch_relay(&relay);
+                *self.relay.borrow_mut() = Some(relay);
+                "Phones signed in to the same folksonic account can reach Studio through the server."
+                    .to_owned()
+            }
+            Ok(Err(RelayError::NotOffered)) => {
+                "This server does not offer remote control through folksonic.".to_owned()
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "no relay remote");
+                format!("Remote control through folksonic cannot start: {error}.")
+            }
+            Err(_) => return,
+        };
+        *self.relay_status.borrow_mut() = text;
+    }
+
+    /// Mirrors the relay connection's state in the status line.
+    fn watch_relay(self: &Rc<Self>, relay: &RelayRemote) {
+        let mut status = relay.status();
+        let (tx, mut rx) = mpsc::channel::<RelayStatus>(4);
+        self.runtime.spawn(async move {
+            while status.changed().await.is_ok() {
+                let now = status.borrow_and_update().clone();
+                if tx.send(now).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let generation = self.relay_generation.get();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            while let Some(now) = rx.recv().await {
+                let Some(me) = weak.upgrade() else { break };
+                if me.relay_generation.get() != generation {
+                    break;
+                }
+                let text = match now {
+                    RelayStatus::Connected => "Phones signed in to the same folksonic account can reach Studio through the server.".to_owned(),
+                    RelayStatus::Connecting => "Connecting to the folksonic relay…".to_owned(),
+                    RelayStatus::Retrying { reason } => {
+                        format!("The folksonic relay is not reachable ({reason}); trying again.")
+                    }
+                };
+                *me.relay_status.borrow_mut() = text;
+                me.notify();
+            }
+        });
+    }
+
+    /// Stops the relay. The returned work withdraws Studio's record from
+    /// folksonic; `None` when the relay was not running.
+    fn stop_relay(&self) -> Option<Pending> {
+        self.relay_generation.set(self.relay_generation.get() + 1);
+        self.relay_status.borrow_mut().clear();
+        let relay = self.relay.borrow_mut().take()?;
+        Some(Box::pin(async move {
+            if let Err(error) = relay.stop().await {
+                tracing::warn!(%error, "relay record not withdrawn");
+            }
+        }))
+    }
+
+    /// The signed-in server changed: the relay follows it.
+    pub(crate) fn set_server(self: &Rc<Self>, server: Option<RelayServer>) {
+        if let Some(pending) = self.stop_relay() {
+            self.runtime.spawn(pending);
+        }
+        *self.server.borrow_mut() = server;
+        let me = Rc::clone(self);
+        glib::spawn_future_local(async move { me.apply().await });
+    }
+
+    /// Signing out of the server with `key`: the relay stops, and the
+    /// returned work withdraws Studio's record while the key still works.
+    pub(crate) fn sign_out(&self, key: &str) -> Option<Pending> {
+        let matches = self
+            .server
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.client.server().key() == key);
+        if !matches {
+            return None;
+        }
+        self.server.borrow_mut().take();
+        let pending = self.stop_relay();
+        self.notify();
+        pending
+    }
+
     /// The hub, made on first use with Studio's identity from the keyring.
     async fn hub(self: &Rc<Self>) -> Option<Arc<Hub>> {
         if let Some(hub) = self.hub.borrow().clone() {
@@ -266,8 +422,9 @@ impl Remote {
             HubEvent::PairRequest {
                 name,
                 transport,
+                comparison,
                 decision,
-            } => self.ask(&name, transport, decision),
+            } => self.ask(&name, transport, comparison.as_deref(), decision),
             HubEvent::Paired { .. } => self.notify(),
             HubEvent::Command { command, reply, .. } => (self.on_command)(command, reply),
             HubEvent::Connected {
@@ -297,18 +454,34 @@ impl Remote {
     }
 
     /// Asks the user whether a phone may pair.
-    fn ask(&self, name: &str, transport: Transport, decision: oneshot::Sender<bool>) {
-        let over = match transport {
-            Transport::Ble => "over Bluetooth",
-            Transport::Network => "on the local network",
+    fn ask(
+        &self,
+        name: &str,
+        transport: Transport,
+        comparison: Option<&str>,
+        decision: oneshot::Sender<bool>,
+    ) {
+        let detail = match comparison {
+            // Pairing through folksonic: no QR code, so the user compares
+            // the codes on both screens instead.
+            Some(code) => format!(
+                "A phone signed in to your folksonic account asks through the server.\n\n\
+                 Code: {}\n\n\
+                 Allow it only if your phone shows the same code. You can revoke it later.",
+                spaced(code)
+            ),
+            None => {
+                let over = transport_phrase(transport);
+                format!(
+                    "A phone scanned Studio's pairing code and asks {over}. \
+                     Allow it only if it is your phone. You can revoke it later."
+                )
+            }
         };
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
             .message(format!("Allow “{name}” to control Studio?"))
-            .detail(format!(
-                "A phone scanned Studio's pairing code and asks {over}. \
-                 Allow it only if it is your phone. You can revoke it later."
-            ))
+            .detail(detail)
             .buttons(["Reject", "Allow"])
             .cancel_button(0)
             .default_button(0)
@@ -395,10 +568,10 @@ impl Remote {
     /// What the dialog says about the transports.
     pub(crate) fn status(&self) -> String {
         let settings = self.settings.get();
-        if !settings.network && !settings.bluetooth {
+        if !settings.network && !settings.bluetooth && !settings.relay {
             return "Remote control is off.".to_owned();
         }
-        let mut parts: Vec<String> = [&self.network_status, &self.ble_status]
+        let mut parts: Vec<String> = [&self.ble_status, &self.relay_status, &self.network_status]
             .iter()
             .map(|s| s.borrow().clone())
             .filter(|s| !s.is_empty())
@@ -440,6 +613,24 @@ impl Remote {
         for listener in listeners {
             listener();
         }
+    }
+}
+
+/// How a transport reads after "asks".
+pub(crate) fn transport_phrase(transport: Transport) -> &'static str {
+    match transport {
+        Transport::Ble => "over Bluetooth",
+        Transport::Network => "on the local network",
+        Transport::Relay => "through folksonic",
+    }
+}
+
+/// "123456" as "123 456", easier to compare at a glance.
+fn spaced(code: &str) -> String {
+    if code.len() == 6 && code.is_ascii() {
+        format!("{} {}", &code[..3], &code[3..])
+    } else {
+        code.to_owned()
     }
 }
 

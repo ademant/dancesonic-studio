@@ -62,12 +62,14 @@ impl Window {
         let label = &self.bar.remote;
         match sessions.last() {
             Some(last) => {
-                let (short, long) = match last.transport {
-                    Transport::Ble => ("BT", "Bluetooth"),
-                    Transport::Network => ("Wi-Fi", "the network"),
+                let short = match last.transport {
+                    Transport::Ble => "BT",
+                    Transport::Network => "Wi-Fi",
+                    Transport::Relay => "Relay",
                 };
+                let over = crate::remote::transport_phrase(last.transport);
                 label.set_text(short);
-                label.set_tooltip_text(Some(&format!("Controlled by {} over {long}", last.name)));
+                label.set_tooltip_text(Some(&format!("Controlled by {} {over}", last.name)));
                 label.set_visible(true);
             }
             None => label.set_visible(false),

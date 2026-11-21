@@ -15,6 +15,8 @@ pub const MAX_WRONG_PROOFS: u8 = 5;
 pub const MAX_NAME_CHARS: usize = 64;
 
 const PAIR_LABEL: &[u8] = b"dancesonic-pair-v1\0";
+const PAIR_CODE_LABEL: &[u8] = b"dancesonic-pair-code-v1\0";
+const COMPARE_LABEL: &[u8] = b"dancesonic-compare-v1\0";
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
@@ -131,13 +133,51 @@ pub fn pair_transcript(
     noise_key: &[u8],
     binding: &[u8; 32],
 ) -> Vec<u8> {
-    let mut t = Vec::with_capacity(PAIR_LABEL.len() + 32 + device_key.len() + noise_key.len() + 32);
-    t.extend_from_slice(PAIR_LABEL);
+    labelled_transcript(PAIR_LABEL, fingerprint, device_key, noise_key, binding)
+}
+
+/// The bytes a `pair_code_request` signature covers (pairing through
+/// folksonic, #38). A different label from [`pair_transcript`], so a
+/// signature made for one kind of pairing is never valid for the other.
+pub fn pair_code_transcript(
+    fingerprint: &[u8; 32],
+    device_key: &[u8],
+    noise_key: &[u8],
+    binding: &[u8; 32],
+) -> Vec<u8> {
+    labelled_transcript(PAIR_CODE_LABEL, fingerprint, device_key, noise_key, binding)
+}
+
+fn labelled_transcript(
+    label: &[u8],
+    fingerprint: &[u8; 32],
+    device_key: &[u8],
+    noise_key: &[u8],
+    binding: &[u8; 32],
+) -> Vec<u8> {
+    let mut t = Vec::with_capacity(label.len() + 32 + device_key.len() + noise_key.len() + 32);
+    t.extend_from_slice(label);
     t.extend_from_slice(fingerprint);
     t.extend_from_slice(device_key);
     t.extend_from_slice(noise_key);
     t.extend_from_slice(binding);
     t
+}
+
+/// The 6-digit comparison code both screens show when a phone pairs through
+/// folksonic (#38), from the Noise handshake hash of the session.
+///
+/// A man in the middle, folksonic included, runs two handshakes, one with
+/// each side, and so gets two different hashes: the codes on the two
+/// screens differ, and the user rejects the phone.
+pub fn comparison_code(binding: &[u8; 32]) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::new()
+        .chain_update(COMPARE_LABEL)
+        .chain_update(binding)
+        .finalize();
+    let n = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 1_000_000;
+    format!("{n:06}")
 }
 
 /// HMAC-SHA256 of `transcript` with `secret`: what the phone sends as proof.

@@ -7,7 +7,7 @@
 //! the app as [`HubEvent`]s. The app answers through the `oneshot` senders.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -61,6 +61,9 @@ pub enum HubEvent {
     PairRequest {
         name: String,
         transport: Transport,
+        /// The comparison code to show next to the question, when the phone
+        /// pairs through folksonic (#38); `None` for a QR pairing.
+        comparison: Option<String>,
         decision: oneshot::Sender<bool>,
     },
     /// The user accepted a phone and it was stored.
@@ -104,6 +107,9 @@ pub struct Hub {
     revoked: broadcast::Sender<DeviceId>,
     connections: AtomicUsize,
     rates: Mutex<HashMap<DeviceId, (i64, u32)>>,
+    /// A pairing by comparison code is waiting for the user. One at a time,
+    /// so another device of the account cannot pile up dialogs.
+    code_pairing: AtomicBool,
 }
 
 impl std::fmt::Debug for Hub {
@@ -137,6 +143,7 @@ impl Hub {
             revoked: broadcast::channel(16).0,
             connections: AtomicUsize::new(0),
             rates: Mutex::new(HashMap::new()),
+            code_pairing: AtomicBool::new(false),
         })
     }
 
@@ -228,13 +235,22 @@ impl Drop for Slot {
     }
 }
 
+/// Marks a pairing by comparison code as waiting; cleared on drop.
+struct CodePairing(Arc<Hub>);
+
+impl Drop for CodePairing {
+    fn drop(&mut self) {
+        self.0.code_pairing.store(false, Ordering::Release);
+    }
+}
+
 /// What the transport established about a connection.
 #[derive(Debug, Clone)]
 pub struct Link {
     pub transport: Transport,
     /// The channel binding: the TLS exporter or the Noise handshake hash.
     pub binding: [u8; 32],
-    /// The phone's Noise static key (Bluetooth only).
+    /// The phone's Noise static key (Bluetooth and the relay).
     pub peer_noise: Option<[u8; 32]>,
 }
 
@@ -378,6 +394,19 @@ impl Session {
                 self.pair(v, &name, &device_key, &noise_key, &proof, &sig)
                     .await
             }
+            Incoming::PairCodeRequest {
+                v,
+                name,
+                device_key,
+                noise_key,
+                sig,
+            } => {
+                if matches!(self.phase, Phase::Ready(_)) {
+                    return self.refuse("bad_message").await;
+                }
+                self.pair_code(v, &name, &device_key, &noise_key, &sig)
+                    .await
+            }
             Incoming::Hello {
                 device,
                 counter,
@@ -412,15 +441,20 @@ impl Session {
             return self.refuse("rate_limited").await;
         }
         self.last_pair_ms = Some(now);
-        let parsed = (|| {
-            let name = clean_name(name)?;
-            let device_key = super::from_b64u(device_key, 65).filter(|k| k.len() == 65)?;
-            let noise_key: [u8; 32] = super::from_b64u(noise_key, 32)?.try_into().ok()?;
+        let parsed = parse_pairing(v, name, device_key, noise_key, sig).and_then(|p| {
             let proof = super::from_b64u(proof, 32).filter(|p| p.len() == 32)?;
-            let sig = super::from_b64u(sig, 80)?;
-            (v == super::PROTOCOL_VERSION).then_some((name, device_key, noise_key, proof, sig))
-        })();
-        let Some((name, device_key, noise_key, proof, sig)) = parsed else {
+            Some((p, proof))
+        });
+        let Some((
+            Pairing {
+                name,
+                device_key,
+                noise_key,
+                sig,
+            },
+            proof,
+        )) = parsed
+        else {
             return self.refuse("bad_message").await;
         };
         // On Bluetooth the phone registers the key it is talking with.
@@ -451,6 +485,79 @@ impl Session {
             tracing::info!(reason = %e, "pairing request refused");
             return self.refuse(e.code()).await;
         }
+        self.decide_and_store(name, &device_key, &noise_key, None, now)
+            .await
+    }
+
+    /// Pairing through folksonic (#38): only on the relay, where the Noise
+    /// session already proves the phone holds `noise_key`. No QR secret: the
+    /// user allows the phone in Studio after comparing the code on both
+    /// screens.
+    async fn pair_code(
+        &mut self,
+        v: u8,
+        name: &str,
+        device_key: &str,
+        noise_key: &str,
+        sig: &str,
+    ) -> Flow {
+        if self.link.transport != Transport::Relay {
+            return self.refuse("not_on_transport").await;
+        }
+        let now = self.hub.clock.now_ms();
+        if self.last_pair_ms.is_some_and(|last| now - last < 1000) {
+            return self.refuse("rate_limited").await;
+        }
+        self.last_pair_ms = Some(now);
+        let Some(Pairing {
+            name,
+            device_key,
+            noise_key,
+            sig,
+        }) = parse_pairing(v, name, device_key, noise_key, sig)
+        else {
+            return self.refuse("bad_message").await;
+        };
+        // The relay link always knows the peer's Noise key; it must be the
+        // one the phone registers.
+        if self.link.peer_noise != Some(noise_key) {
+            return self.refuse("bad_message").await;
+        }
+        let transcript = offer::pair_code_transcript(
+            self.hub.identity.fingerprint(),
+            &device_key,
+            &noise_key,
+            &self.link.binding,
+        );
+        if !verify(&device_key, &transcript, &sig) {
+            return self.refuse("bad_signature").await;
+        }
+        if self
+            .hub
+            .code_pairing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return self.refuse("rate_limited").await;
+        }
+        // Released however this ends, also when the session is dropped while
+        // the user still decides.
+        let _waiting = CodePairing(Arc::clone(&self.hub));
+        let comparison = offer::comparison_code(&self.link.binding);
+        self.decide_and_store(name, &device_key, &noise_key, Some(comparison), now)
+            .await
+    }
+
+    /// Asks the user about a phone whose request checked out, and stores it
+    /// when they accept.
+    async fn decide_and_store(
+        &mut self,
+        name: String,
+        device_key: &[u8],
+        noise_key: &[u8; 32],
+        comparison: Option<String>,
+        now: i64,
+    ) -> Flow {
         if !self.send(Outgoing::PairPending).await {
             return Flow::Close;
         }
@@ -461,6 +568,7 @@ impl Session {
             .send(HubEvent::PairRequest {
                 name: name.clone(),
                 transport: self.link.transport,
+                comparison,
                 decision,
             })
             .await
@@ -479,7 +587,7 @@ impl Session {
             return Flow::Close;
         }
         let stored = DeviceId::random().ok().and_then(|id| {
-            devices::add(&self.hub.db, &id, &name, &device_key, &noise_key, now)
+            devices::add(&self.hub.db, &id, &name, device_key, noise_key, now)
                 .ok()
                 .map(|()| id)
         });
@@ -721,6 +829,36 @@ fn verify(device_key: &[u8], message: &[u8], der: &[u8]) -> bool {
     // Android's Keystore may produce high-S signatures; both forms are valid.
     let sig = sig.normalize_s();
     key.verify(message, &sig).is_ok()
+}
+
+/// The fields every pairing request carries: name, device key, Noise key and
+/// signature, decoded with their sizes checked. `None` for anything malformed
+/// or another protocol version.
+fn parse_pairing(
+    v: u8,
+    name: &str,
+    device_key: &str,
+    noise_key: &str,
+    sig: &str,
+) -> Option<Pairing> {
+    let name = clean_name(name)?;
+    let device_key = super::from_b64u(device_key, 65).filter(|k| k.len() == 65)?;
+    let noise_key: [u8; 32] = super::from_b64u(noise_key, 32)?.try_into().ok()?;
+    let sig = super::from_b64u(sig, 80)?;
+    (v == super::PROTOCOL_VERSION).then_some(Pairing {
+        name,
+        device_key,
+        noise_key,
+        sig,
+    })
+}
+
+/// The decoded fields of a pairing request.
+struct Pairing {
+    name: String,
+    device_key: Vec<u8>,
+    noise_key: [u8; 32],
+    sig: Vec<u8>,
 }
 
 /// A display name without control characters, 1 to 64 characters.

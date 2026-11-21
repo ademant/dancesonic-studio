@@ -3342,6 +3342,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "secrecy",
  "serde",
  "serde_json",

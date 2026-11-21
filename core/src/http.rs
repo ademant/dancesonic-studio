@@ -43,16 +43,23 @@ pub struct HttpSettings {
 /// there must be at least one; anything else is refused rather than ignored,
 /// so a bad pin can never silently turn into no pin.
 fn pinned_certificates(pem: &[u8]) -> Result<Vec<Certificate>, HttpError> {
+    pinned_certificate_ders(pem)?
+        .iter()
+        .map(|der| Certificate::from_der(der.as_ref()).map_err(|_| HttpError::BadPin))
+        .collect()
+}
+
+/// The pinned certificates as DER, for clients that build their own TLS
+/// configuration (the relay WebSocket). Same rules as for the HTTP client:
+/// only certificates, at least one.
+pub fn pinned_certificate_ders(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, HttpError> {
     let blocks: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<_, _>>()
         .map_err(|_| HttpError::BadPin)?;
     if blocks.is_empty() {
         return Err(HttpError::BadPin);
     }
-    blocks
-        .iter()
-        .map(|der| Certificate::from_der(der.as_ref()).map_err(|_| HttpError::BadPin))
-        .collect()
+    Ok(blocks)
 }
 
 /// Longest a stream may go without any bytes arriving.

@@ -3,8 +3,8 @@
 The protocol between the DanceSonic Android app (the *phone*) and DanceSonic
 Studio (*Studio*), so the phone can control playback on the desktop
 (ademant/dancesonic-studio#19, ademant/dancesonic#88). The same messages run
-over Bluetooth Low Energy and over the local network. Neither side ever needs
-an IP address typed or stored.
+over Bluetooth Low Energy, through folksonic's relay and over the local
+network. Neither side ever needs an IP address typed or stored.
 
 Machine-readable parts:
 
@@ -108,6 +108,42 @@ After 5 wrong proofs the secret is void.
 The connection stays open after `pair_accepted`; the phone continues with
 `hello`.
 
+### Through folksonic, by comparing codes (#38)
+
+A phone signed in to the same folksonic account as Studio can pair without the
+QR code, over the relay only:
+
+1. The phone reads Studio's record from `GET /api/relay/devices` (see the
+   relay transport) and takes `fp` from it. The record is only a claim: the
+   server could have replaced it.
+2. It opens a relay session (Noise XX, prologue bound to that `fp`) and checks
+   `identity` against `fp` as on Bluetooth.
+3. It sends `pair_code_request`, signed like a `pair_request` but without a
+   proof, since there is no secret:
+
+   ```
+   T = "dancesonic-pair-code-v1\0" || fp || device_key || noise_key || binding
+   sig = ECDSA(device key, T)
+   ```
+
+   `noise_key` must be the Noise static key of this session.
+4. Both sides show the comparison code of the session:
+
+   ```
+   h = SHA-256("dancesonic-compare-v1\0" || binding)
+   code = (big-endian u32 of h[0..4]) mod 1 000 000, as six digits
+   ```
+
+   Studio answers `pair_pending` and asks the user, showing the phone's name
+   and the code. The user allows the phone only if both screens show the same
+   code. A server in the middle runs two handshakes with different hashes, so
+   the codes differ.
+5. As with the QR code: `pair_accepted` or `pair_rejected`.
+
+Studio refuses `pair_code_request` on any other transport
+(`not_on_transport`), takes at most one a second per connection, and lets only
+one wait for the user at a time (`rate_limited` otherwise).
+
 ## Sessions and commands
 
 ### `hello`
@@ -196,7 +232,10 @@ A command outside the transport's features is refused with
 
 ## Transports
 
-### Bluetooth LE (preferred)
+Phones try the transports in this order: Bluetooth, the folksonic relay, the
+local network.
+
+### Bluetooth LE (first)
 
 - **GATT service:** the UUID from the QR code, advertised only while "Allow
   remote control over Bluetooth" is on. The advertisement carries the service
@@ -223,7 +262,47 @@ A command outside the transport's features is refused with
   sends `network_hint` with its current local addresses and HTTPS port, so the
   phone can open the network transport where mDNS is blocked.
 
-### Local network (fallback, and for browsing)
+### folksonic relay (second)
+
+For rooms where the phone and Studio cannot see each other but both reach the
+same folksonic server (ademant/folksonic#159). Off by default; "Allow remote
+control through folksonic" turns it on, and it runs only while Studio is
+signed in.
+
+- **Record:** Studio publishes `PUT /api/relay/devices/{id}` with
+  `kind: "studio"`, its name and
+  `publicKey = b64u(0x01 || noise_public (32) || BLE service UUID (16) || tls_spki)`.
+  `id = "studio-" || b64u(SHA-256("dancesonic-relay-id-v1\0" || fp)[0..12])`,
+  so it changes when Studio's identity is reset. Studio removes the record
+  (`DELETE`) when the switch goes off and before signing out. Only public
+  keys are in it.
+- **Connection:** each device holds one WebSocket to
+  `GET /api/relay/connect?device={id}`, the credential in a header
+  (`X-Api-Key` or `DPoP`), never in the URL. HTTPS only, unless the server was
+  added with the warned plain-http opt-in for a private address.
+- **Relay frames:** binary messages `[id length (1)][device id][payload]`;
+  the id is the recipient when sending and the sender when receiving. At most
+  16 KiB per message and about 25 per second. A text message
+  `{"type":"undelivered","to":…}` from folksonic means the other device is not
+  connected; Studio ends that phone's session.
+- **Payload:** `[kind (1)][Noise message]`: kind 1 is the phone's first
+  handshake message (it starts a new session and replaces any older one from
+  that device), kind 3 a later handshake message, kind 2 a transport message.
+- **Noise:** `Noise_XX_25519_ChaChaPoly_BLAKE2s`, phone as initiator.
+  Prologue: `"dancesonic-relay-v1\0" || fp`. The fingerprint check
+  (`identity`), the phone key rule and the channel binding are as on
+  Bluetooth.
+- **Chunks:** the plaintext of each transport message is `[flags (1)][chunk]`,
+  bit 0 of `flags` = `FIN`, the chunk at most 15 KiB. A protocol message is
+  at most 64 KiB from the phone; Studio's may be larger (library answers,
+  covers). A tampered, replayed, reordered or missing frame fails Noise and
+  ends the session.
+- **Keepalive:** a phone sends `get_state` at least every 30 seconds; Studio
+  ends a relay session silent for 90 seconds. folksonic itself drops a
+  connection after 60 seconds without traffic, so both sides ping.
+- The relay carries the same features as the local network.
+
+### Local network (third, and for browsing)
 
 - **Discovery:** mDNS service `_dancesonic._tcp`, announced only while "Allow
   remote control" is on. TXT records: `v=1` and
@@ -248,19 +327,23 @@ A command outside the transport's features is refused with
 
 ### Switching
 
-If one transport drops, the phone opens the other and sends `hello` with its
+If one transport drops, the phone opens the next one and sends `hello` with its
 next counter. Studio's play queue and playback do not depend on the connection.
 Both sides know the active transport: `welcome.transport` names it, and Studio
-shows **BT** or **Wi-Fi**.
+shows **BT**, **Relay** or **Wi-Fi**. A phone paired on any transport uses the
+same keys and counter on all of them.
 
 ## Limits and revocation
 
-- Pairing: 5 wrong proofs per secret; at most 1 `pair_request` per second per
-  connection.
+- Pairing: 5 wrong proofs per secret; at most 1 `pair_request` or
+  `pair_code_request` per second per connection; one code pairing waiting for
+  the user at a time.
 - Commands: at most 20 per second per phone; more are refused with
   `rate_limited`.
 - At most 4 connections at once.
-- Messages: 64 KiB on the network, 16 KiB on Bluetooth, checked before parsing.
+- Messages: 64 KiB on the network and the relay, 16 KiB on Bluetooth,
+  checked before parsing.
+- Relay: at most 8 phones with a session or a handshake at once.
 - Paired phones are listed in Studio and can be revoked. A revoked phone's
   `hello` or command gets `bye` with `reason: "revoked"`, and the connection
   closes.
@@ -276,6 +359,9 @@ shows **BT** or **Wi-Fi**.
 - A transport link is never the only proof: every command is signed with the
   device key and counted.
 - Scanning the QR code alone never pairs: the user accepts the phone in Studio.
+- folksonic sees only who talks to whom, and when: every relay message is
+  Noise ciphertext. It cannot pair a phone of its own unnoticed, because the
+  user compares the codes.
 - Nothing secret is logged: no QR content, pairing secret, proof, signature or
   key.
 - The network hint is sent only inside the Noise session, never in the

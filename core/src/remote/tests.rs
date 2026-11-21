@@ -30,7 +30,7 @@ impl Clock for TestClock {
 }
 
 impl TestClock {
-    fn advance(&self, ms: i64) {
+    pub(crate) fn advance(&self, ms: i64) {
         self.0.fetch_add(ms, Ordering::SeqCst);
     }
 }
@@ -41,6 +41,11 @@ pub(crate) struct App {
     pub(crate) accept: bool,
     pub(crate) commands: Vec<Command>,
     pub(crate) paired: Vec<String>,
+    /// The comparison code of each pairing request, `None` for a QR one.
+    pub(crate) comparisons: Vec<Option<String>>,
+    /// Keep the decision open instead of answering at once.
+    pub(crate) hold: bool,
+    pub(crate) held: Vec<tokio::sync::oneshot::Sender<bool>>,
 }
 
 pub(crate) struct Rig {
@@ -72,10 +77,20 @@ pub(crate) fn rig() -> Rig {
     tokio::spawn(async move {
         while let Some(event) = received.recv().await {
             match event {
-                HubEvent::PairRequest { decision, name, .. } => {
+                HubEvent::PairRequest {
+                    decision,
+                    name,
+                    comparison,
+                    ..
+                } => {
                     assert_eq!(name, "Pixel");
-                    let yes = seen.lock().unwrap().accept;
-                    let _ = decision.send(yes);
+                    let mut app = seen.lock().unwrap();
+                    app.comparisons.push(comparison);
+                    if app.hold {
+                        app.held.push(decision);
+                    } else {
+                        let _ = decision.send(app.accept);
+                    }
                 }
                 HubEvent::Paired { name, .. } => seen.lock().unwrap().paired.push(name),
                 HubEvent::Command { command, reply, .. } => {
@@ -96,14 +111,19 @@ pub(crate) fn rig() -> Rig {
 }
 
 /// A connection straight into the hub, without a transport.
-struct Conn {
+pub(crate) struct Conn {
     tx: mpsc::Sender<Vec<u8>>,
     rx: mpsc::Receiver<Vec<u8>>,
     binding: [u8; 32],
 }
 
 impl Conn {
-    fn open(hub: &Arc<Hub>, transport: Transport, binding: u8, peer: Option<[u8; 32]>) -> Self {
+    pub(crate) fn open(
+        hub: &Arc<Hub>,
+        transport: Transport,
+        binding: u8,
+        peer: Option<[u8; 32]>,
+    ) -> Self {
         let (tx, incoming) = mpsc::channel(8);
         let (outgoing, rx) = mpsc::channel(32);
         let link = Link {
@@ -119,11 +139,11 @@ impl Conn {
         }
     }
 
-    async fn send(&self, message: Vec<u8>) {
+    pub(crate) async fn send(&self, message: Vec<u8>) {
         self.tx.send(message).await.unwrap();
     }
 
-    async fn recv(&mut self) -> Value {
+    pub(crate) async fn recv(&mut self) -> Value {
         let bytes = tokio::time::timeout(Duration::from_secs(5), self.rx.recv())
             .await
             .expect("an answer")
@@ -157,7 +177,7 @@ async fn pair(rig: &Rig, phone: &mut Phone) -> Conn {
     conn
 }
 
-async fn hello(conn: &mut Conn, phone: &mut Phone) -> Value {
+pub(crate) async fn hello(conn: &mut Conn, phone: &mut Phone) -> Value {
     let binding = conn.binding;
     conn.send(phone.hello(&binding)).await;
     conn.recv().await
@@ -635,12 +655,12 @@ fn frames_split_and_join_messages() {
 }
 
 /// The phone side of the Bluetooth link, over frame channels.
-struct BlePhone {
+pub(crate) struct BlePhone {
     to_studio: mpsc::Sender<Vec<u8>>,
     from_studio: mpsc::Receiver<Vec<u8>>,
     joined: Reassembler,
     noise: snow::TransportState,
-    binding: [u8; 32],
+    pub(crate) binding: [u8; 32],
     studio_static: [u8; 32],
 }
 
@@ -658,7 +678,7 @@ async fn next(rx: &mut mpsc::Receiver<Vec<u8>>, joined: &mut Reassembler) -> Vec
     }
 }
 
-async fn ble_connect(rig: &Rig, phone: &Phone) -> BlePhone {
+pub(crate) async fn ble_connect(rig: &Rig, phone: &Phone) -> BlePhone {
     let (to_studio, frames_in) = mpsc::channel(64);
     let (frames_out, mut from_studio) = mpsc::channel(64);
     tokio::spawn(ble::serve_link(
@@ -701,7 +721,7 @@ async fn ble_connect(rig: &Rig, phone: &Phone) -> BlePhone {
 }
 
 impl BlePhone {
-    async fn send(&mut self, message: &[u8]) {
+    pub(crate) async fn send(&mut self, message: &[u8]) {
         let mut buf = vec![0u8; 70_000];
         let n = self.noise.write_message(message, &mut buf).unwrap();
         for f in frames(&buf[..n], MTU) {
@@ -709,7 +729,7 @@ impl BlePhone {
         }
     }
 
-    async fn recv(&mut self) -> Value {
+    pub(crate) async fn recv(&mut self) -> Value {
         let sealed = next(&mut self.from_studio, &mut self.joined).await;
         let mut buf = vec![0u8; 70_000];
         let n = self.noise.read_message(&sealed, &mut buf).unwrap();
@@ -793,7 +813,7 @@ fn the_pair_transcript_is_what_the_document_says() {
 
 /// Pairs over Bluetooth and returns the open link after `welcome` and the
 /// first `state`.
-async fn ble_paired(rig: &Rig, phone: &mut Phone) -> BlePhone {
+pub(crate) async fn ble_paired(rig: &Rig, phone: &mut Phone) -> BlePhone {
     let (uri, _) = rig.hub.new_offer().unwrap();
     let scanned = scan(uri.expose_secret());
     let mut link = ble_connect(rig, phone).await;

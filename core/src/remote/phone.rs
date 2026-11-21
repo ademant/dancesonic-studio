@@ -98,6 +98,32 @@ impl Phone {
         .into_bytes()
     }
 
+    /// A `pair_code_request` for pairing through folksonic, to the Studio
+    /// with fingerprint `fp` (from its record).
+    pub(crate) fn pair_code_request(
+        &self,
+        fp: &[u8; 32],
+        binding: &[u8; 32],
+        name: &str,
+    ) -> Vec<u8> {
+        let t = super::offer::pair_code_transcript(
+            fp,
+            &self.device_key(),
+            &self.noise_public(),
+            binding,
+        );
+        json!({
+            "type": "pair_code_request",
+            "v": 1,
+            "name": name,
+            "device_key": b64u(&self.device_key()),
+            "noise_key": b64u(&self.noise_public()),
+            "sig": self.sign(&t),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
     pub(crate) fn hello(&mut self, binding: &[u8; 32]) -> Vec<u8> {
         self.counter += 1;
         self.hello_at(self.counter, binding)

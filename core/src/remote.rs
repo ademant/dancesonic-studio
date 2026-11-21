@@ -10,6 +10,7 @@
 //! - [`hub`]: what every connection does, whatever its transport.
 //! - [`ble`]: framing over GATT and the Noise session for Bluetooth.
 //! - [`network`]: HTTPS and WebSocket on the local network, with mDNS.
+//! - [`relay`]: folksonic's relay, with pairing by comparison code (#38).
 //! - [`settings`]: the switches, off by default.
 
 pub mod ble;
@@ -19,10 +20,13 @@ pub mod identity;
 pub mod messages;
 pub mod network;
 pub mod offer;
+pub mod relay;
 pub mod settings;
 
 #[cfg(test)]
 pub(crate) mod phone;
+#[cfg(test)]
+mod relay_tests;
 #[cfg(test)]
 mod tests;
 
