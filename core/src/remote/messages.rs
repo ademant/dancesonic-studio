@@ -19,6 +19,8 @@ pub const MAX_BODY_LEN: usize = 32 * 1024;
 pub enum Transport {
     Ble,
     Network,
+    /// folksonic's relay between devices of one account (#38).
+    Relay,
 }
 
 impl Transport {
@@ -27,6 +29,7 @@ impl Transport {
         match self {
             Transport::Ble => "ble",
             Transport::Network => "network",
+            Transport::Relay => "relay",
         }
     }
 
@@ -34,7 +37,9 @@ impl Transport {
     pub fn features(self) -> &'static [&'static str] {
         match self {
             Transport::Ble => &["playback", "tempo", "dance", "queue", "network_hint"],
-            Transport::Network => &["playback", "tempo", "dance", "queue", "library", "cover"],
+            Transport::Network | Transport::Relay => {
+                &["playback", "tempo", "dance", "queue", "library", "cover"]
+            }
         }
     }
 
@@ -42,7 +47,7 @@ impl Transport {
     pub fn max_message(self) -> usize {
         match self {
             Transport::Ble => 16 * 1024,
-            Transport::Network => 64 * 1024,
+            Transport::Network | Transport::Relay => 64 * 1024,
         }
     }
 }
@@ -57,6 +62,15 @@ pub enum Incoming {
         device_key: String,
         noise_key: String,
         proof: String,
+        sig: String,
+    },
+    /// Pairing through folksonic (relay only): no QR secret; the user
+    /// compares a code derived from the Noise handshake on both screens.
+    PairCodeRequest {
+        v: u8,
+        name: String,
+        device_key: String,
+        noise_key: String,
         sig: String,
     },
     Hello {
@@ -90,7 +104,7 @@ impl ParseError {
     }
 }
 
-const KNOWN_TYPES: [&str; 3] = ["pair_request", "hello", "command"];
+const KNOWN_TYPES: [&str; 4] = ["pair_request", "pair_code_request", "hello", "command"];
 
 impl Incoming {
     /// Parses one message of at most `max` bytes.

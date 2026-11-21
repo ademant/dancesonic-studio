@@ -76,7 +76,7 @@ pub(crate) enum Selection {
 /// The settings for a stored server: plain http only for an address that was
 /// accepted with the opt-in, and [`ServerUrl::parse`] still allows that only
 /// for a private address.
-fn settings_for(base_url: &str) -> HttpSettings {
+pub(crate) fn settings_for(base_url: &str) -> HttpSettings {
     let policy = if base_url.starts_with("http://") {
         HttpPolicy::ALLOW_PRIVATE_HTTP
     } else {

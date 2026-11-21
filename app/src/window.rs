@@ -333,6 +333,14 @@ impl Window {
                                 me.open_session();
                             }
                         }),
+                        {
+                            let weak = Rc::downgrade(&me);
+                            Rc::new(move |key: &str| {
+                                let me = weak.upgrade()?;
+                                let remote = me.remote.borrow().clone()?;
+                                remote.sign_out(key)
+                            })
+                        },
                     );
                 }
                 None => me
@@ -553,6 +561,12 @@ impl Window {
             Ok(Some((session, tracks))) => {
                 if let Some(player) = me.player.borrow_mut().as_mut() {
                     player.set_tracks(tracks);
+                }
+                if let Some(remote) = me.remote.borrow().as_ref() {
+                    remote.set_server(Some(crate::remote::RelayServer {
+                        http: session::settings_for(session.client.server().base().as_str()),
+                        client: session.client.clone(),
+                    }));
                 }
                 *me.session.borrow_mut() = Some(session);
                 me.reload_catalog();

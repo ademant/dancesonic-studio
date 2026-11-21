@@ -1,4 +1,4 @@
-//! The remote control switches. Both are off by default.
+//! The remote control switches. All are off by default.
 
 use rusqlite::{Connection, params};
 
@@ -11,6 +11,9 @@ pub struct Settings {
     pub network: bool,
     /// "Allow remote control over Bluetooth".
     pub bluetooth: bool,
+    /// "Allow remote control through folksonic" (#38): publish Studio's
+    /// record and keep a relay connection while signed in.
+    pub relay: bool,
     /// The port tried first for the network transport.
     pub port: u16,
 }
@@ -18,13 +21,14 @@ pub struct Settings {
 /// Reads the settings.
 pub fn load(conn: &Connection) -> Result<Settings, DbError> {
     Ok(conn.query_row(
-        "SELECT network, bluetooth, port FROM remote_settings WHERE id = 1",
+        "SELECT network, bluetooth, port, relay FROM remote_settings WHERE id = 1",
         [],
         |r| {
             Ok(Settings {
                 network: r.get(0)?,
                 bluetooth: r.get(1)?,
                 port: r.get(2)?,
+                relay: r.get(3)?,
             })
         },
     )?)
@@ -34,8 +38,14 @@ pub fn load(conn: &Connection) -> Result<Settings, DbError> {
 pub fn save(db: &Database, settings: Settings) -> Result<(), DbError> {
     db.write(|tx| {
         tx.execute(
-            "UPDATE remote_settings SET network = ?1, bluetooth = ?2, port = ?3 WHERE id = 1",
-            params![settings.network, settings.bluetooth, settings.port],
+            "UPDATE remote_settings SET network = ?1, bluetooth = ?2, port = ?3, relay = ?4
+             WHERE id = 1",
+            params![
+                settings.network,
+                settings.bluetooth,
+                settings.port,
+                settings.relay
+            ],
         )?;
         Ok(())
     })

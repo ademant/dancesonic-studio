@@ -30,6 +30,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0006_offline.sql"),
     include_str!("migrations/0007_remote_devices.sql"),
     include_str!("migrations/0008_remote_settings.sql"),
+    include_str!("migrations/0009_remote_relay.sql"),
 ];
 
 /// The schema version this build creates and understands.
@@ -511,9 +512,16 @@ pub(crate) mod tests {
             .query_row("SELECT last_counter FROM remote_device", [], |r| r.get(0))
             .unwrap();
         assert_eq!(counter, 4);
-        let settings = crate::remote::settings::load(&conn).unwrap();
-        assert!(!settings.network && !settings.bluetooth, "off by default");
-        assert_eq!(settings.port, 47800);
+        // The columns of schema 8; `settings::load` reads today's schema.
+        let (network, bluetooth, port): (bool, bool, i64) = conn
+            .query_row(
+                "SELECT network, bluetooth, port FROM remote_settings WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(!network && !bluetooth, "off by default");
+        assert_eq!(port, 47800);
         assert!(
             conn.execute("UPDATE remote_settings SET port = 80", [])
                 .is_err(),
@@ -523,6 +531,99 @@ pub(crate) mod tests {
             conn.execute("INSERT INTO remote_settings (id) VALUES (2)", [])
                 .is_err(),
             "one settings row"
+        );
+    }
+
+    /// Step 8 → 9 keeps every paired phone with its keys, counter and
+    /// revocation, allows the relay as last transport, and starts with the
+    /// relay off.
+    #[test]
+    fn migration_8_to_9_keeps_phones_and_adds_the_relay_switch() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 8).unwrap();
+        conn.execute(
+            "UPDATE remote_settings SET network = 1, bluetooth = 1, port = 48000",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO remote_device (id, name, device_key, noise_key, last_counter,
+                 paired_at, last_seen_at, last_transport, revoked_at)
+             VALUES (?1, 'Phone', ?2, ?3, 41, 1, 2, 'ble', NULL),
+                    (?4, 'Old', ?5, ?6, 7, 1, 3, 'network', 9)",
+            rusqlite::params![
+                "a".repeat(32),
+                vec![4u8; 65],
+                vec![1u8; 32],
+                "b".repeat(32),
+                vec![5u8; 65],
+                vec![2u8; 32]
+            ],
+        )
+        .unwrap();
+        migrate_to(&mut conn, 9).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 9);
+
+        type Row = (String, i64, Option<String>, Option<i64>, Vec<u8>);
+        let rows: Vec<Row> = conn
+            .prepare(
+                "SELECT id, last_counter, last_transport, revoked_at, noise_key
+                 FROM remote_device ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "a".repeat(32),
+                    41,
+                    Some("ble".to_owned()),
+                    None,
+                    vec![1u8; 32]
+                ),
+                (
+                    "b".repeat(32),
+                    7,
+                    Some("network".to_owned()),
+                    Some(9),
+                    vec![2u8; 32]
+                ),
+            ]
+        );
+        conn.execute(
+            "UPDATE remote_device SET last_transport = 'relay' WHERE id = ?1",
+            ["a".repeat(32)],
+        )
+        .unwrap();
+        assert!(
+            conn.execute("UPDATE remote_device SET last_transport = 'usb'", [])
+                .is_err(),
+            "only known transports"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO remote_device (id, name, device_key, noise_key, last_counter,
+                     paired_at) VALUES (?1, 'Dup', ?2, ?3, 0, 1)",
+                rusqlite::params!["c".repeat(32), vec![6u8; 65], vec![1u8; 32]],
+            )
+            .is_err(),
+            "noise keys stay unique"
+        );
+
+        let settings = crate::remote::settings::load(&conn).unwrap();
+        assert!(settings.network && settings.bluetooth, "switches kept");
+        assert_eq!(settings.port, 48000);
+        assert!(!settings.relay, "relay off by default");
+        assert!(
+            conn.execute("UPDATE remote_settings SET relay = 2", [])
+                .is_err()
         );
     }
 

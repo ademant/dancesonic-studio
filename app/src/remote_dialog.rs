@@ -1,4 +1,4 @@
-//! "Remote control" (#20, #24): the switches, "Pair a phone" with its QR
+//! "Remote control" (#20, #24, #38): the switches, "Pair a phone" with its QR
 //! code, and the paired phones with a way to revoke each one.
 
 use std::cell::{Cell, RefCell};
@@ -21,6 +21,7 @@ struct Dialog {
     remote: Rc<Remote>,
     network: gtk::CheckButton,
     bluetooth: gtk::CheckButton,
+    relay: gtk::CheckButton,
     status: gtk::Label,
     phones: gtk::ListBox,
     pair: gtk::Button,
@@ -48,7 +49,8 @@ pub(crate) fn present(parent: &gtk::ApplicationWindow, remote: &Rc<Remote>) {
     let intro = gtk::Label::builder()
         .label(
             "The DanceSonic app on your phone can control playback here. \
-             Phones pair only by scanning Studio's code, and only after you allow them.",
+             Phones pair only by scanning Studio's code, or through folksonic after you \
+             compare a code on both screens, and only after you allow them.",
         )
         .wrap(true)
         .xalign(0.0)
@@ -57,6 +59,11 @@ pub(crate) fn present(parent: &gtk::ApplicationWindow, remote: &Rc<Remote>) {
     let bluetooth = gtk::CheckButton::with_label("Allow remote control over Bluetooth");
     bluetooth.set_tooltip_text(Some(
         "Phones find Studio over Bluetooth Low Energy, also where there is no Wi-Fi",
+    ));
+    let relay = gtk::CheckButton::with_label("Allow remote control through folksonic");
+    relay.set_tooltip_text(Some(
+        "Phones signed in to the same folksonic account reach Studio through the server, \
+         also on different networks. folksonic forwards only encrypted messages.",
     ));
     let status = gtk::Label::builder()
         .xalign(0.0)
@@ -115,6 +122,7 @@ pub(crate) fn present(parent: &gtk::ApplicationWindow, remote: &Rc<Remote>) {
     body.append(&intro);
     body.append(&network);
     body.append(&bluetooth);
+    body.append(&relay);
     body.append(&status);
     body.append(&pair);
     body.append(&code_box);
@@ -129,6 +137,7 @@ pub(crate) fn present(parent: &gtk::ApplicationWindow, remote: &Rc<Remote>) {
         remote: Rc::clone(remote),
         network,
         bluetooth,
+        relay,
         status,
         phones,
         pair,
@@ -149,6 +158,12 @@ pub(crate) fn present(parent: &gtk::ApplicationWindow, remote: &Rc<Remote>) {
     });
     let weak = Rc::downgrade(&dialog);
     dialog.bluetooth.connect_toggled(move |_| {
+        if let Some(d) = weak.upgrade() {
+            d.save();
+        }
+    });
+    let weak = Rc::downgrade(&dialog);
+    dialog.relay.connect_toggled(move |_| {
         if let Some(d) = weak.upgrade() {
             d.save();
         }
@@ -202,6 +217,9 @@ impl Dialog {
         let mut settings = self.remote.settings();
         settings.network = self.network.is_active();
         settings.bluetooth = self.bluetooth.is_active();
+        settings.relay = self.relay.is_active();
+        // The QR code needs Bluetooth or the network: the relay pairs by
+        // comparing codes instead.
         if !settings.network && !settings.bluetooth {
             self.hide_code();
         }
@@ -213,6 +231,7 @@ impl Dialog {
         self.updating.set(true);
         self.network.set_active(settings.network);
         self.bluetooth.set_active(settings.bluetooth);
+        self.relay.set_active(settings.relay);
         self.updating.set(false);
         self.status.set_text(&self.remote.status());
         self.pair.set_sensitive(self.remote.can_pair());
@@ -383,6 +402,7 @@ fn transport_name(transport: Transport) -> &'static str {
     match transport {
         Transport::Ble => "Bluetooth",
         Transport::Network => "the network",
+        Transport::Relay => "folksonic",
     }
 }
 
