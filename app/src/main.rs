@@ -4,6 +4,7 @@ mod analysis_dialog;
 mod ble_remote;
 mod connection_dialog;
 mod folders_dialog;
+mod match_dialog;
 mod mpris;
 mod player;
 mod remote;

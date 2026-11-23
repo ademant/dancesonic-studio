@@ -25,7 +25,9 @@ use crate::mpris::{Command, Mpris, NowPlaying};
 use crate::player::{Player, PlayerEvent, Track};
 use crate::seek_bar::SeekBar;
 use crate::session::{self, Catalog, Selection, Session};
-use crate::{Banner, Services, analysis_dialog, connection_dialog, folders_dialog, tag_dialog};
+use crate::{
+    Banner, Services, analysis_dialog, connection_dialog, folders_dialog, match_dialog, tag_dialog,
+};
 
 mod remote_commands;
 
@@ -197,12 +199,17 @@ impl Window {
         );
         let folders_button = icon_button("folder-music-symbolic", "Music folders on this computer");
         let analysis_button = icon_button("system-run-symbolic", "Analyse local files");
+        let match_button = icon_button(
+            "edit-find-symbolic",
+            "Match untagged files by their fingerprint",
+        );
         let remote_button = icon_button("phone-symbolic", "Remote control by a phone");
         let header = gtk::HeaderBar::new();
         header.pack_start(&connect_button);
         header.pack_start(&sync_button);
         header.pack_start(&folders_button);
         header.pack_start(&analysis_button);
+        header.pack_start(&match_button);
         header.pack_end(&remote_button);
         header.set_title_widget(Some(&search));
         window.set_titlebar(Some(&header));
@@ -257,6 +264,12 @@ impl Window {
         analysis_button.connect_clicked(move |_| {
             if let Some(me) = weak.upgrade() {
                 me.show_analysis();
+            }
+        });
+        let weak = Rc::downgrade(&me);
+        match_button.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.show_matching();
             }
         });
         let weak = Rc::downgrade(&me);
@@ -712,6 +725,21 @@ impl Window {
             &self.runtime,
             services.db,
             tag_dialog::Scope { one, all, list },
+            self.tags_written(),
+        );
+    }
+
+    /// Matching untagged local files by their fingerprint (#14).
+    fn show_matching(self: &Rc<Self>) {
+        let Some(services) = self.services.borrow().clone() else {
+            self.banner
+                .show("Studio is still starting. Try again in a moment.");
+            return;
+        };
+        match_dialog::present(
+            &self.window,
+            &self.runtime,
+            services.db,
             self.tags_written(),
         );
     }
