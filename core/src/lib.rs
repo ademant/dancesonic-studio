@@ -26,6 +26,7 @@ pub mod server_extras;
 pub mod sign_in;
 pub mod subsonic;
 pub mod sync;
+pub mod tag_editor;
 pub mod tempo;
 pub mod track_source;
 

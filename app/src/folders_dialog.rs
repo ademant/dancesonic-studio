@@ -52,7 +52,7 @@ pub(crate) fn present(
     let intro = gtk::Label::builder()
         .label(
             "Studio lists the audio files in these folders and watches them for changes. \
-             It never changes or deletes them.",
+             It never deletes them, and changes them only when you edit their tags.",
         )
         .wrap(true)
         .xalign(0.0)

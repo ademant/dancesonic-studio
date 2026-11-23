@@ -11,6 +11,7 @@ mod remote_dialog;
 mod secret_service;
 mod seek_bar;
 mod session;
+mod tag_dialog;
 mod track_feed;
 mod window;
 

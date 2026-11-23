@@ -11,7 +11,7 @@ const MBID: &str = "6e2a8f50-58c4-4c44-9a4c-0d7a3c8f1b11";
 
 /// A WAV file of `seconds` of silence, with `extra` bytes so two files can
 /// differ in content.
-fn wav(path: &Path, seconds: u32, extra: u8) {
+pub(crate) fn wav(path: &Path, seconds: u32, extra: u8) {
     let rate: u32 = 8_000;
     let mut data = vec![0u8; usize::try_from(rate * 2 * seconds).unwrap()];
     data[0] = extra;
@@ -36,7 +36,14 @@ fn wav(path: &Path, seconds: u32, extra: u8) {
 }
 
 /// A WAV file with an ID3v2 tag.
-fn tagged(path: &Path, title: &str, artist: &str, album: &str, mbid: Option<&str>, bpm: &str) {
+pub(crate) fn tagged(
+    path: &Path,
+    title: &str,
+    artist: &str,
+    album: &str,
+    mbid: Option<&str>,
+    bpm: &str,
+) {
     wav(path, 1, title.len() as u8);
     let mut tag = Tag::new(TagType::Id3v2);
     tag.insert_text(ItemKey::TrackTitle, title.into());

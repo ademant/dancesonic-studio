@@ -25,7 +25,7 @@ use crate::mpris::{Command, Mpris, NowPlaying};
 use crate::player::{Player, PlayerEvent, Track};
 use crate::seek_bar::SeekBar;
 use crate::session::{self, Catalog, Selection, Session};
-use crate::{Banner, Services, analysis_dialog, connection_dialog, folders_dialog};
+use crate::{Banner, Services, analysis_dialog, connection_dialog, folders_dialog, tag_dialog};
 
 mod remote_commands;
 
@@ -113,6 +113,8 @@ struct Detail {
     playlist_names: gtk::StringList,
     playlist_ids: RefCell<Vec<String>>,
     add_button: gtk::Button,
+    /// "Edit tags…" of a track with a local file (#15).
+    edit_tags: gtk::Button,
     song: RefCell<Option<Song>>,
 }
 
@@ -255,6 +257,12 @@ impl Window {
         analysis_button.connect_clicked(move |_| {
             if let Some(me) = weak.upgrade() {
                 me.show_analysis();
+            }
+        });
+        let weak = Rc::downgrade(&me);
+        me.detail.edit_tags.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.edit_tags();
             }
         });
         let weak = Rc::downgrade(&me);
@@ -639,6 +647,73 @@ impl Window {
             )
         }));
         analyses.present(&self.window);
+    }
+
+    /// What to do after the tags of local files changed: say so, and show
+    /// the library as the files are now.
+    fn tags_written(self: &Rc<Self>) -> tag_dialog::OnWritten {
+        let weak = Rc::downgrade(self);
+        Rc::new(move |text: &str| {
+            if let Some(me) = weak.upgrade() {
+                me.status.set_text(text);
+                me.reload_catalog();
+                me.refresh_shown();
+            }
+        })
+    }
+
+    /// Reads the shown track list again, so it shows changed tags.
+    fn refresh_shown(self: &Rc<Self>) {
+        let shown = self.tracks.shown.borrow().clone();
+        if let Some((title, selection)) = shown {
+            self.show_songs(title, selection);
+        }
+    }
+
+    /// "Edit tags…" for the track shown in the detail pane, and the other
+    /// local files of the list (#15).
+    fn edit_tags(self: &Rc<Self>) {
+        let Some(services) = self.services.borrow().clone() else {
+            self.banner
+                .show("Studio is still starting. Try again in a moment.");
+            return;
+        };
+        let Some(one) = self
+            .detail
+            .song
+            .borrow()
+            .as_ref()
+            .filter(|s| !s.kept_offline)
+            .and_then(|s| s.local_id)
+        else {
+            return;
+        };
+        let mut all = Vec::new();
+        for item in self.tracks.store.iter::<BoxedAnyObject>().flatten() {
+            let song = item.borrow::<Song>();
+            if let Some(id) = song.local_id.filter(|_| !song.kept_offline)
+                && !all.contains(&id)
+            {
+                all.push(id);
+            }
+        }
+        if !all.contains(&one) {
+            all.insert(0, one);
+        }
+        let list = self
+            .tracks
+            .shown
+            .borrow()
+            .as_ref()
+            .map(|(title, _)| title.clone())
+            .unwrap_or_default();
+        tag_dialog::present(
+            &self.window,
+            &self.runtime,
+            services.db,
+            tag_dialog::Scope { one, all, list },
+            self.tags_written(),
+        );
     }
 
     /// Brings the offline copies in line with the pins and the settings.
@@ -1153,10 +1228,14 @@ impl Window {
             ] {
                 label.set_text("");
             }
+            d.edit_tags.set_sensitive(false);
             self.update_add_button();
             return;
         };
         d.title.set_text(&song.title);
+        // Offline copies are the server's files, not the user's.
+        d.edit_tags
+            .set_sensitive(song.local_id.is_some() && !song.kept_offline);
         d.artist
             .set_text(song.artist_name.as_deref().unwrap_or("Unknown artist"));
         d.album.set_text(&match (&song.album_name, song.year) {
@@ -1737,6 +1816,12 @@ impl Detail {
         playlist_choice.update_property(&[gtk::accessible::Property::Label("Playlist")]);
         let add_button = gtk::Button::with_label("Add");
         add_button.set_tooltip_text(Some("Add this track to the chosen playlist"));
+        let edit_tags = gtk::Button::builder()
+            .label("Edit tags…")
+            .halign(gtk::Align::Start)
+            .sensitive(false)
+            .tooltip_text("Change the tags in this track's local file")
+            .build();
 
         let grid = gtk::Grid::builder()
             .row_spacing(6)
@@ -1777,6 +1862,7 @@ impl Detail {
         column.append(&album);
         column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         column.append(&grid);
+        column.append(&edit_tags);
         let widget = gtk::ScrolledWindow::builder()
             .child(&column)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1796,6 +1882,7 @@ impl Detail {
             playlist_names,
             playlist_ids: RefCell::default(),
             add_button,
+            edit_tags,
             song: RefCell::default(),
         }
     }
