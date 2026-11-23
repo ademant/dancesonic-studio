@@ -1,5 +1,6 @@
 //! "Analyse local files" (#11): runs folksentia over the local music folders
-//! and shows how far it is.
+//! and shows how far it is. Also runs a job list from folksonic against a
+//! local copy of its music folder, for its offline analysis (#12).
 //!
 //! The run belongs to the window, not to the dialog: closing the dialog keeps
 //! it going, opening it again shows its progress, and closing the window stops
@@ -7,27 +8,53 @@
 //! stay, and the next start continues with what is left.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use gtk::prelude::*;
 use gtk::{gio, glib};
-use studio_core::analysis::{self, Folksentia, Progress, Selection, Settings, Status};
+use studio_core::analysis::jobs::{self, JobList, JobProgress, JobRun};
+use studio_core::analysis::{
+    self, AnalysisError, Folksentia, Progress, Selection, Settings, Status,
+};
 use studio_core::db::Database;
 
 /// Called on the main thread when a run ended, with a line for the status
 /// bar. The window reloads the library then, so new BPMs show.
 pub(crate) type OnFinished = Rc<dyn Fn(&str)>;
 
-/// The analysis runs of one window: at most one at a time.
+/// The analysis runs of one window: at most one at a time, of the library
+/// or of a job list.
 pub(crate) struct Analyses {
     runtime: Arc<tokio::runtime::Runtime>,
     db: Arc<Database>,
     running: RefCell<Option<tokio::task::AbortHandle>>,
     /// The last progress of the running analysis.
-    progress: RefCell<Option<Progress>>,
+    progress: RefCell<Option<Shown>>,
+    /// The job list run being set up; kept while the dialog is closed.
+    setup: RefCell<JobSetup>,
     dialog: RefCell<Weak<Dialog>>,
     on_finished: OnFinished,
+}
+
+/// Progress as the dialog shows it.
+#[derive(Clone, Debug, PartialEq)]
+struct Shown {
+    fraction: f64,
+    text: String,
+}
+
+/// What a job list run needs (#12).
+#[derive(Default)]
+struct JobSetup {
+    /// The job list and what it holds, or why it cannot be used.
+    list: Option<(PathBuf, Result<JobList, String>)>,
+    /// The local copy of folksonic's music folder.
+    music: Option<PathBuf>,
+    /// The result file; an existing one is continued.
+    results: Option<PathBuf>,
+    size_only: bool,
 }
 
 impl Drop for Analyses {
@@ -45,6 +72,8 @@ struct Look {
     settings: Result<Settings, String>,
     tool: Result<Folksentia, String>,
     status: Result<Status, String>,
+    /// The local music folders, to offer the first as folksonic's.
+    folders: Vec<PathBuf>,
 }
 
 struct Dialog {
@@ -55,6 +84,12 @@ struct Dialog {
     retry: gtk::CheckButton,
     newer: gtk::CheckButton,
     start: gtk::Button,
+    jobs_file: gtk::Label,
+    music: gtk::Label,
+    results: gtk::Label,
+    size_only: gtk::CheckButton,
+    run_jobs: gtk::Button,
+    import_help: gtk::Label,
     stop: gtk::Button,
     bar: gtk::ProgressBar,
     progress: gtk::Label,
@@ -75,6 +110,7 @@ impl Analyses {
             db,
             running: RefCell::default(),
             progress: RefCell::default(),
+            setup: RefCell::default(),
             dialog: RefCell::default(),
             on_finished,
         })
@@ -99,9 +135,6 @@ impl Analyses {
 
     /// Starts analysing the library, unless a run is going on.
     fn start_library(self: &Rc<Self>, tool: Folksentia, selection: Selection, parallel: usize) {
-        if self.is_running() {
-            return;
-        }
         let (sender, receiver) = async_channel::unbounded::<Progress>();
         let work = analysis::analyse_library(
             Arc::clone(&self.db),
@@ -113,6 +146,31 @@ impl Analyses {
                 let _ = sender.try_send(progress.clone());
             },
         );
+        self.start_run(work, receiver, library_shown, finished_text);
+    }
+
+    /// Runs a job list from folksonic (#12), unless a run is going on.
+    fn start_jobs(self: &Rc<Self>, tool: Folksentia, list: JobList, run: JobRun) {
+        let (sender, receiver) = async_channel::unbounded::<JobProgress>();
+        let work = jobs::run(tool, list, run, move |progress| {
+            // The receiver is gone only when the window is.
+            let _ = sender.try_send(progress.clone());
+        });
+        self.start_run(work, receiver, jobs_shown, jobs_finished_text);
+    }
+
+    /// Runs `work` on the runtime, shows what `receiver` reports, and tells
+    /// the window when it ended.
+    fn start_run<P: 'static, T: Send + 'static>(
+        self: &Rc<Self>,
+        work: impl Future<Output = Result<T, AnalysisError>> + Send + 'static,
+        receiver: async_channel::Receiver<P>,
+        shown: fn(&P) -> Shown,
+        finished: fn(&T) -> String,
+    ) {
+        if self.is_running() {
+            return;
+        }
         let handle = self.runtime.spawn(work);
         *self.running.borrow_mut() = Some(handle.abort_handle());
         *self.progress.borrow_mut() = None;
@@ -122,7 +180,7 @@ impl Analyses {
         glib::spawn_future_local(async move {
             while let Ok(progress) = receiver.recv().await {
                 let Some(me) = weak.upgrade() else { break };
-                *me.progress.borrow_mut() = Some(progress);
+                *me.progress.borrow_mut() = Some(shown(&progress));
                 me.update_dialog();
             }
         });
@@ -132,7 +190,7 @@ impl Analyses {
             let Some(me) = weak.upgrade() else { return };
             me.running.borrow_mut().take();
             let text = match result {
-                Ok(Ok(progress)) => finished_text(&progress),
+                Ok(Ok(done)) => finished(&done),
                 Ok(Err(error)) => format!("The analysis stopped: {error}"),
                 Err(error) if error.is_cancelled() => {
                     "The analysis was stopped. Start it again to continue.".to_owned()
@@ -211,13 +269,80 @@ impl Dialog {
             .css_classes(["dim-label"])
             .build();
         let start = gtk::Button::with_label("Analyse");
-        start.add_css_class("suggested-action");
+        start.set_halign(gtk::Align::End);
+
+        // Offline analysis for folksonic (#12).
+        let offline_intro = gtk::Label::builder()
+            .label(
+                "folksonic can have its library analysed on this computer. On the server, \
+                 export a job list with \
+                 tinysonic analysis export -c /etc/tinysonic/tinysonic.toml -all -out jobs.json \
+                 and copy it here. Studio runs it against your copy of the server's music \
+                 folder and writes results.jsonl for the server to import.",
+            )
+            .wrap(true)
+            .xalign(0.0)
+            .selectable(true)
+            .build();
+        let path_label = || {
+            gtk::Label::builder()
+                .xalign(0.0)
+                .hexpand(true)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .build()
+        };
+        let jobs_file = path_label();
+        let music = path_label();
+        let results = path_label();
+        let open_jobs = gtk::Button::with_label("Open…");
+        open_jobs.update_property(&[gtk::accessible::Property::Label("Open a job list")]);
+        let choose_music = gtk::Button::with_label("Choose…");
+        choose_music.update_property(&[gtk::accessible::Property::Label(
+            "Choose the copy of the music folder",
+        )]);
+        let choose_results = gtk::Button::with_label("Choose…");
+        choose_results
+            .update_property(&[gtk::accessible::Property::Label("Choose the result file")]);
+        let grid = gtk::Grid::builder()
+            .column_spacing(12)
+            .row_spacing(6)
+            .build();
+        for (row, (name, label, button)) in [
+            ("Job list", &jobs_file, &open_jobs),
+            ("Music folder", &music, &choose_music),
+            ("Result file", &results, &choose_results),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = i32::try_from(row).unwrap_or(0);
+            let name = gtk::Label::builder()
+                .label(name)
+                .xalign(0.0)
+                .css_classes(["dim-label"])
+                .build();
+            button.set_valign(gtk::Align::Center);
+            grid.attach(&name, 0, row, 1, 1);
+            grid.attach(label, 1, row, 1, 1);
+            grid.attach(button, 2, row, 1, 1);
+        }
+        let size_only = gtk::CheckButton::with_label(
+            "Compare sizes only (for a copy that did not keep modification times)",
+        );
+        let run_jobs = gtk::Button::with_label("Run job list");
+        run_jobs.set_halign(gtk::Align::End);
+        let import_help = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .build();
+
         let stop = gtk::Button::with_label("Stop");
         let close = gtk::Button::with_label("Close");
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         buttons.set_halign(gtk::Align::End);
         buttons.append(&stop);
-        buttons.append(&start);
         buttons.append(&close);
 
         let heading = |text: &str| {
@@ -245,10 +370,25 @@ impl Dialog {
         body.append(&summary);
         body.append(&retry);
         body.append(&newer);
+        body.append(&start);
+        body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        body.append(&heading("Job list from folksonic"));
+        body.append(&offline_intro);
+        body.append(&grid);
+        body.append(&size_only);
+        body.append(&run_jobs);
+        body.append(&import_help);
+        body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         body.append(&bar);
         body.append(&progress);
         body.append(&buttons);
-        window.set_child(Some(&body));
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&body)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(760)
+            .build();
+        window.set_child(Some(&scroll));
 
         let dialog = Rc::new(Self {
             window,
@@ -258,6 +398,12 @@ impl Dialog {
             retry,
             newer,
             start,
+            jobs_file,
+            music,
+            results,
+            size_only,
+            run_jobs,
+            import_help,
             stop,
             bar,
             progress,
@@ -273,6 +419,38 @@ impl Dialog {
         dialog.start.connect_clicked(move |_| {
             if let Some(me) = weak.upgrade() {
                 me.start();
+            }
+        });
+        let weak = Rc::downgrade(&dialog);
+        open_jobs.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.choose_jobs();
+            }
+        });
+        let weak = Rc::downgrade(&dialog);
+        choose_music.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.choose_music();
+            }
+        });
+        let weak = Rc::downgrade(&dialog);
+        choose_results.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.choose_results();
+            }
+        });
+        let weak = Rc::downgrade(&dialog);
+        dialog.size_only.connect_toggled(move |check| {
+            let Some(me) = weak.upgrade() else { return };
+            if let Some(owner) = me.owner.upgrade() {
+                owner.setup.borrow_mut().size_only = check.is_active();
+            }
+            me.show_setup();
+        });
+        let weak = Rc::downgrade(&dialog);
+        dialog.run_jobs.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.start_jobs();
             }
         });
         let weak = Rc::downgrade(&dialog);
@@ -335,11 +513,18 @@ impl Dialog {
             return;
         };
         self.start.set_sensitive(false);
+        self.run_jobs.set_sensitive(false);
         self.tool.set_text("Looking for folksentia…");
         self.spawn(look(Arc::clone(&owner.db)), |me, look| {
             me.show_look(&look);
+            if let Some(owner) = me.owner.upgrade() {
+                let mut setup = owner.setup.borrow_mut();
+                if setup.music.is_none() {
+                    setup.music = look.folders.first().cloned();
+                }
+            }
             *me.look.borrow_mut() = Some(look);
-            me.update_start();
+            me.show_setup();
         });
     }
 
@@ -359,28 +544,61 @@ impl Dialog {
         });
     }
 
-    /// "Analyse" can start when folksentia was found and nothing runs.
+    /// "Analyse" can start when folksentia was found and nothing runs; "Run
+    /// job list" also needs a usable list, a folder and a result file.
     fn update_start(&self) {
-        let running = self.owner.upgrade().is_some_and(|o| o.is_running());
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        let running = owner.is_running();
         let ready = self
             .look
             .borrow()
             .as_ref()
             .is_some_and(|l| l.tool.is_ok() && l.settings.is_ok());
+        let setup = owner.setup.borrow();
+        let jobs_ready = matches!(setup.list, Some((_, Ok(_))))
+            && setup.music.is_some()
+            && setup.results.is_some();
         self.start.set_sensitive(ready && !running);
+        self.run_jobs.set_sensitive(ready && jobs_ready && !running);
         self.stop.set_sensitive(running);
     }
 
-    fn show_running(&self, progress: Option<&Progress>, running: bool) {
-        if let Some(progress) = progress {
-            let fraction = if progress.total == 0 {
-                1.0
-            } else {
-                progress.done as f64 / progress.total as f64
+    /// Shows the job list run as it is set up.
+    fn show_setup(&self) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        {
+            let setup = owner.setup.borrow();
+            self.jobs_file.set_text(&match &setup.list {
+                None => "None yet".to_owned(),
+                Some((path, Ok(list))) => list_text(path, list),
+                Some((path, Err(error))) => format!("{}: {error}", path.display()),
+            });
+            let shown = |path: &Option<PathBuf>| {
+                path.as_ref()
+                    .map_or_else(|| "None yet".to_owned(), |p| p.display().to_string())
             };
-            self.bar.set_fraction(fraction);
+            self.music.set_text(&shown(&setup.music));
+            self.results.set_text(&shown(&setup.results));
+            if self.size_only.is_active() != setup.size_only {
+                self.size_only.set_active(setup.size_only);
+            }
+            self.import_help.set_text(&import_text(
+                setup.results.as_ref().and_then(|p| p.file_name()),
+                setup.size_only,
+            ));
+        }
+        self.update_start();
+    }
+
+    fn show_running(&self, progress: Option<&Shown>, running: bool) {
+        if let Some(progress) = progress {
+            self.bar.set_fraction(progress.fraction);
             if running {
-                self.progress.set_text(&progress_text(progress));
+                self.progress.set_text(&progress.text);
             }
         } else if running {
             self.bar.set_fraction(0.0);
@@ -402,6 +620,126 @@ impl Dialog {
             other_versions: self.newer.is_active(),
         };
         owner.start_library(tool, selection, analysis::parallel_for(settings.parallel));
+    }
+
+    fn start_jobs(self: &Rc<Self>) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        let ready = self.look.borrow().as_ref().and_then(clone_ready);
+        let Some((tool, settings)) = ready else {
+            return;
+        };
+        let (list, run) = {
+            let setup = owner.setup.borrow();
+            let (Some((_, Ok(list))), Some(music), Some(results)) =
+                (&setup.list, &setup.music, &setup.results)
+            else {
+                return;
+            };
+            let run = JobRun {
+                music_root: music.clone(),
+                results: results.clone(),
+                size_only: setup.size_only,
+                parallel: analysis::parallel_for(settings.parallel),
+            };
+            (list.clone(), run)
+        };
+        owner.start_jobs(tool, list, run);
+    }
+
+    /// Opens a job list and reads it. A result file next to it is offered.
+    fn choose_jobs(self: &Rc<Self>) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Job lists (JSON)"));
+        filter.add_pattern("*.json");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let chooser = gtk::FileDialog::builder()
+            .title("Open a job list from folksonic")
+            .modal(true)
+            .filters(&filters)
+            .build();
+        let weak = Rc::downgrade(self);
+        chooser.open(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let (Some(me), Ok(file)) = (weak.upgrade(), result) else {
+                    return;
+                };
+                let Some(path) = file.path() else {
+                    me.jobs_file
+                        .set_text("Only a file on this computer can be opened.");
+                    return;
+                };
+                me.jobs_file.set_text("Reading…");
+                let read = path.clone();
+                me.spawn(
+                    async move {
+                        tokio::task::spawn_blocking(move || jobs::load(&read))
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r.map_err(|e| e.to_string()))
+                    },
+                    move |me, list| {
+                        if let Some(owner) = me.owner.upgrade() {
+                            let mut setup = owner.setup.borrow_mut();
+                            if setup.results.is_none() {
+                                setup.results = path.parent().map(|dir| dir.join("results.jsonl"));
+                            }
+                            setup.list = Some((path, list));
+                        }
+                        me.show_setup();
+                    },
+                );
+            },
+        );
+    }
+
+    fn choose_music(self: &Rc<Self>) {
+        let chooser = gtk::FileDialog::builder()
+            .title("The copy of folksonic's music folder")
+            .modal(true)
+            .build();
+        let weak = Rc::downgrade(self);
+        chooser.select_folder(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let (Some(me), Ok(file)) = (weak.upgrade(), result) else {
+                    return;
+                };
+                if let (Some(path), Some(owner)) = (file.path(), me.owner.upgrade()) {
+                    owner.setup.borrow_mut().music = Some(path);
+                }
+                me.show_setup();
+            },
+        );
+    }
+
+    /// Picks where results go. An existing file is continued, not replaced.
+    fn choose_results(self: &Rc<Self>) {
+        let chooser = gtk::FileDialog::builder()
+            .title("Result file for folksonic")
+            .modal(true)
+            .initial_name("results.jsonl")
+            .accept_label("Choose")
+            .build();
+        let weak = Rc::downgrade(self);
+        chooser.save(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let (Some(me), Ok(file)) = (weak.upgrade(), result) else {
+                    return;
+                };
+                if let (Some(path), Some(owner)) = (file.path(), me.owner.upgrade()) {
+                    owner.setup.borrow_mut().results = Some(path);
+                }
+                me.show_setup();
+            },
+        );
     }
 
     fn choose_program(self: &Rc<Self>) {
@@ -463,6 +801,7 @@ fn clone_ready(look: &Look) -> Option<(Folksentia, Settings)> {
 
 /// Reads the settings, looks for folksentia and counts the analysed tracks.
 async fn look(db: Arc<Database>) -> Look {
+    let reader_db = Arc::clone(&db);
     let reader = Arc::clone(&db);
     let settings = tokio::task::spawn_blocking(move || {
         analysis::settings(&reader.reader().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
@@ -482,10 +821,25 @@ async fn look(db: Arc<Database>) -> Look {
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
+    let folders = {
+        let db = Arc::clone(&reader_db);
+        tokio::task::spawn_blocking(move || {
+            let conn = db.reader().ok()?;
+            studio_core::local_library::folders(&conn).ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.path)
+        .collect()
+    };
     Look {
         settings,
         tool,
         status,
+        folders,
     }
 }
 
@@ -507,6 +861,103 @@ fn status_text(status: &Status) -> String {
             status.other_version
         ));
     }
+    text
+}
+
+fn fraction(done: usize, total: usize) -> f64 {
+    if total == 0 {
+        1.0
+    } else {
+        done as f64 / total as f64
+    }
+}
+
+fn library_shown(progress: &Progress) -> Shown {
+    Shown {
+        fraction: fraction(progress.done, progress.total),
+        text: progress_text(progress),
+    }
+}
+
+fn jobs_shown(progress: &JobProgress) -> Shown {
+    Shown {
+        fraction: fraction(progress.done, progress.total),
+        text: jobs_progress_text(progress),
+    }
+}
+
+/// A job list as the dialog lists it.
+fn list_text(path: &std::path::Path, list: &JobList) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    match &list.created {
+        Some(created) => format!("{name}: {} tracks, exported {created}", list.jobs.len()),
+        None => format!("{name}: {} tracks", list.jobs.len()),
+    }
+}
+
+/// How to import the result file on the server.
+fn import_text(results: Option<&std::ffi::OsStr>, size_only: bool) -> String {
+    let file = results.map_or_else(
+        || "results.jsonl".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let flag = if size_only { " -size-only" } else { "" };
+    format!(
+        "Then copy {file} to the server, check it, and store it:\n\
+         tinysonic analysis import -c /etc/tinysonic/tinysonic.toml -dry-run{flag} {file}\n\
+         tinysonic analysis import -c /etc/tinysonic/tinysonic.toml{flag} {file}\n\
+         The check stores nothing. A stopped run continues the same result file."
+    )
+}
+
+fn jobs_progress_text(progress: &JobProgress) -> String {
+    let mut text = format!("{} of {} jobs", progress.done, progress.total);
+    for (count, what) in [
+        (progress.failed, "failed"),
+        (progress.missing, "missing"),
+        (progress.changed, "changed"),
+    ] {
+        if count > 0 {
+            text.push_str(&format!(", {count} {what}"));
+        }
+    }
+    if progress.already > 0 {
+        text.push_str(&format!(" ({} were done before)", progress.already));
+    }
+    if let Some(last) = &progress.last {
+        text.push_str(&format!(". Last: {last}"));
+    }
+    if let Some(error) = &progress.last_error {
+        text.push_str(&format!("\nLast error: {error}"));
+    }
+    text
+}
+
+fn jobs_finished_text(progress: &JobProgress) -> String {
+    if progress.total == 0 {
+        return format!(
+            "Job list: all {} jobs are in the result file. Import it on the server.",
+            progress.jobs
+        );
+    }
+    let mut text = format!("Job list: {} jobs done", progress.done);
+    let mut notes = Vec::new();
+    for (count, what) in [
+        (progress.failed, "failed"),
+        (progress.missing, "not in the music folder"),
+        (progress.changed, "changed since the export"),
+    ] {
+        if count > 0 {
+            notes.push(format!("{count} {what}"));
+        }
+    }
+    if !notes.is_empty() {
+        text.push_str(&format!(" ({})", notes.join(", ")));
+    }
+    text.push_str(". Import the result file on the server.");
     text
 }
 
@@ -683,6 +1134,60 @@ esac
         let dialog = analyses.dialog.borrow().upgrade().expect("dialog");
         pump_until(5000, || dialog.summary.text().starts_with("2 of 3"));
         assert!(!dialog.stop.is_sensitive());
+
+        // A job list from folksonic (#12), run against the same folder.
+        let stamp = |name: &str| {
+            let meta = std::fs::metadata(music.join(name)).expect("meta");
+            let mtime = meta
+                .modified()
+                .expect("mtime")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after 1970")
+                .as_millis();
+            serde_json::json!({"id": format!("so-{name}"), "path": name,
+                "size": meta.len(), "mtimeMs": mtime as i64, "features": ["bpm"]})
+        };
+        let list = serde_json::json!({
+            "format": "tinysonic-analysis-jobs", "version": 1,
+            "created": "2026-11-13T10:00:00Z", "tool": "folksentia", "schema": 1,
+            "options": {"downbeats": true},
+            "jobs": [stamp("a good.flac"), stamp("b broken.flac"),
+                     {"id": "so-x", "path": "gone.flac", "size": 1, "mtimeMs": 1,
+                      "features": ["bpm"]}],
+        });
+        let jobs_path = base.join("jobs.json");
+        std::fs::write(&jobs_path, list.to_string()).expect("jobs");
+        {
+            let read = jobs::load(&jobs_path).expect("list");
+            let mut setup = analyses.setup.borrow_mut();
+            setup.list = Some((jobs_path.clone(), Ok(read)));
+            setup.results = Some(base.join("results.jsonl"));
+        }
+        dialog.show_setup();
+        assert_eq!(
+            dialog.music.text(),
+            music.canonicalize().expect("music").display().to_string(),
+            "the local folder is offered"
+        );
+        assert_eq!(
+            dialog.jobs_file.text(),
+            "jobs.json: 3 tracks, exported 2026-11-13T10:00:00Z"
+        );
+        assert!(dialog.run_jobs.is_sensitive());
+        finished.borrow_mut().clear();
+        dialog.run_jobs.emit_clicked();
+        pump_until(15000, || !finished.borrow().is_empty());
+        assert_eq!(
+            *finished.borrow(),
+            "Job list: 3 jobs done (1 failed, 1 not in the music folder). \
+             Import the result file on the server."
+        );
+        let results = std::fs::read_to_string(base.join("results.jsonl")).expect("results");
+        assert_eq!(results.lines().count(), 3);
+        save(
+            dialog.window.upcast_ref(),
+            &shots.join("analysis-4-jobs.png"),
+        );
     }
 
     #[test]
@@ -721,5 +1226,35 @@ esac
             }),
             "Analysis: 4 files analysed, 1 failed."
         );
+
+        let jobs = JobProgress {
+            jobs: 10,
+            already: 4,
+            total: 6,
+            done: 3,
+            failed: 1,
+            missing: 1,
+            changed: 0,
+            last: Some("A/tune.flac".to_owned()),
+            last_error: None,
+        };
+        assert_eq!(
+            jobs_progress_text(&jobs),
+            "3 of 6 jobs, 1 failed, 1 missing (4 were done before). Last: A/tune.flac"
+        );
+        assert_eq!(
+            jobs_finished_text(&jobs),
+            "Job list: 3 jobs done (1 failed, 1 not in the music folder). \
+             Import the result file on the server."
+        );
+        assert_eq!(
+            jobs_finished_text(&JobProgress { total: 0, ..jobs }),
+            "Job list: all 10 jobs are in the result file. Import it on the server."
+        );
+        let help = import_text(Some(std::ffi::OsStr::new("out.jsonl")), true);
+        assert!(help.contains(
+            "tinysonic analysis import -c /etc/tinysonic/tinysonic.toml -dry-run -size-only out.jsonl"
+        ));
+        assert!(help.contains("tinysonic.toml -size-only out.jsonl\n"));
     }
 }

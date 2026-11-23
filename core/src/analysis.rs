@@ -1,4 +1,5 @@
-//! Analysis of local files with folksentia (#11).
+//! Analysis of local files with folksentia (#11), and of folksonic's job
+//! lists for its offline analysis ([`jobs`], #12).
 //!
 //! folksentia runs as a separate program ([`Folksentia`]), one process per
 //! file, a few at a time ([`analyse_library`]). Each result is stored with the
@@ -27,6 +28,7 @@ use crate::db::{Database, DbError};
 use crate::local_library;
 
 pub mod folksentia;
+pub mod jobs;
 pub mod output;
 
 pub use folksentia::Folksentia;
@@ -66,6 +68,13 @@ pub enum AnalysisError {
     Schema(Option<u64>),
     #[error("the analysis stopped: {0}")]
     Stopped(String),
+    #[error("{path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("the job list cannot be used: {0}")]
+    Jobs(String),
 }
 
 impl From<rusqlite::Error> for AnalysisError {

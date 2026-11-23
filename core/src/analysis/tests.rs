@@ -31,6 +31,7 @@ case "$last" in
   *crash*) kill -9 $$ ;;
   *slow*) echo $$ > "$last.pid"; exec /bin/sleep 30 ;;
   *old*) printf '{{"schema":1,"file":"x","bpm":100}}' ;;
+  *future*) printf '{{"schema":3,"file":"x","bpm":100}}' ;;
   *noise*) echo 'not json'; echo 'Essentia exploded' >&2; exit 3 ;;
   *flood*) /usr/bin/head -c 70000000 /dev/zero ;;
 esac
@@ -55,7 +56,7 @@ fn fake_program() -> &'static Path {
 }
 
 /// The fake folksentia, retried while a fork elsewhere still holds the file.
-async fn fake() -> Folksentia {
+pub(crate) async fn fake() -> Folksentia {
     let program = fake_program().to_owned();
     for _ in 0..50 {
         match Folksentia::find(Some(&program)).await {
@@ -101,7 +102,7 @@ fn alive(pid: &str) -> bool {
 }
 
 /// Waits up to a second for a process to end.
-async fn ended(pid: &str) -> bool {
+pub(crate) async fn ended(pid: &str) -> bool {
     for _ in 0..50 {
         if !alive(pid) {
             return true;
