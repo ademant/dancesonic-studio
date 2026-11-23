@@ -25,7 +25,7 @@ use crate::mpris::{Command, Mpris, NowPlaying};
 use crate::player::{Player, PlayerEvent, Track};
 use crate::seek_bar::SeekBar;
 use crate::session::{self, Catalog, Selection, Session};
-use crate::{Banner, Services, connection_dialog, folders_dialog};
+use crate::{Banner, Services, analysis_dialog, connection_dialog, folders_dialog};
 
 mod remote_commands;
 
@@ -69,6 +69,9 @@ pub(crate) struct Window {
     watcher: RefCell<Option<FolderWatcher>>,
     /// Remote control by phones (#20, #24).
     remote: RefCell<Option<Rc<crate::remote::Remote>>>,
+    /// Analysis of local files with folksentia (#11); its run stops with
+    /// the window.
+    analyses: RefCell<Option<Rc<analysis_dialog::Analyses>>>,
     /// The state the phones were last told, and when.
     published: RefCell<(Option<studio_core::remote::messages::PlayState>, i64)>,
 }
@@ -191,11 +194,13 @@ impl Window {
             "Update the library from the server",
         );
         let folders_button = icon_button("folder-music-symbolic", "Music folders on this computer");
+        let analysis_button = icon_button("system-run-symbolic", "Analyse local files");
         let remote_button = icon_button("phone-symbolic", "Remote control by a phone");
         let header = gtk::HeaderBar::new();
         header.pack_start(&connect_button);
         header.pack_start(&sync_button);
         header.pack_start(&folders_button);
+        header.pack_start(&analysis_button);
         header.pack_end(&remote_button);
         header.set_title_widget(Some(&search));
         window.set_titlebar(Some(&header));
@@ -218,6 +223,7 @@ impl Window {
             plays: RefCell::default(),
             watcher: RefCell::default(),
             remote: RefCell::default(),
+            analyses: RefCell::default(),
             published: RefCell::default(),
             playing: Cell::new(false),
             rate: Cell::new(Rate::NORMAL),
@@ -243,6 +249,12 @@ impl Window {
         folders_button.connect_clicked(move |_| {
             if let Some(me) = weak.upgrade() {
                 me.show_folders();
+            }
+        });
+        let weak = Rc::downgrade(&me);
+        analysis_button.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.show_analysis();
             }
         });
         let weak = Rc::downgrade(&me);
@@ -603,6 +615,30 @@ impl Window {
                 }
             }),
         );
+    }
+
+    /// The analysis of local files (#11).
+    fn show_analysis(self: &Rc<Self>) {
+        let Some(services) = self.services.borrow().clone() else {
+            self.banner
+                .show("Studio is still starting. Try again in a moment.");
+            return;
+        };
+        let analyses = Rc::clone(self.analyses.borrow_mut().get_or_insert_with(|| {
+            let weak = Rc::downgrade(self);
+            analysis_dialog::Analyses::new(
+                &self.runtime,
+                services.db,
+                Rc::new(move |text| {
+                    if let Some(me) = weak.upgrade() {
+                        me.status.set_text(text);
+                        // Local-only tracks show the BPM found.
+                        me.reload_catalog();
+                    }
+                }),
+            )
+        }));
+        analyses.present(&self.window);
     }
 
     /// Brings the offline copies in line with the pins and the settings.

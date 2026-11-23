@@ -5,6 +5,7 @@
 //! without GTK or GStreamer.
 
 pub mod account;
+pub mod analysis;
 pub mod audio_cache;
 pub mod catalog;
 pub mod connect;
