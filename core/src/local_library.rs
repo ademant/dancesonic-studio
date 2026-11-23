@@ -618,6 +618,10 @@ pub fn resolve_paths(conn: &Connection, songs: &mut [Song]) -> Result<(), LocalE
 const LOCAL_ONLY: &str = "(t.mbid IS NULL OR NOT EXISTS (
      SELECT 1 FROM song s WHERE s.server_id = ?1 AND s.mbid = t.mbid))";
 
+/// The current analysis of a local track (#11), as `la`.
+const ANALYSED: &str = "LEFT JOIN local_analysis la ON la.track_id = t.id AND la.error IS NULL
+     AND la.size_bytes = t.size_bytes AND la.modified_ms = t.modified_ms";
+
 /// The name a local track is listed under.
 const ARTIST_OF: &str = "coalesce(t.album_artist, t.artist, 'Unknown artist')";
 const ALBUM_OF: &str = "coalesce(t.album, 'Unknown album')";
@@ -657,15 +661,16 @@ pub fn local_only_songs(
     filter: &LocalFilter,
     limit: u32,
 ) -> Result<Vec<Song>, LocalError> {
+    // The BPM folksentia found (#11) for the file as it is now, else the tag's.
     let columns = "t.id, t.title, t.artist, t.album, t.track, t.disc, t.year, t.duration_ms,
-                   t.mbid, t.bpm, t.size_bytes, t.rel_path";
+                   t.mbid, coalesce(la.bpm, t.bpm), t.size_bytes, t.rel_path";
     let order = "ORDER BY coalesce(t.album, '') COLLATE NOCASE, t.disc, t.track,
                  coalesce(t.title, t.rel_path) COLLATE NOCASE, t.id LIMIT ?4";
     let server = server_key(server);
     let (sql, a, b) = match filter {
         LocalFilter::Artist(name) => (
             format!(
-                "SELECT {columns} FROM local_track t WHERE {LOCAL_ONLY}
+                "SELECT {columns} FROM local_track t {ANALYSED} WHERE {LOCAL_ONLY}
                  AND {ARTIST_OF} = ?2 COLLATE NOCASE AND ?3 = ?3 {order}"
             ),
             name.clone(),
@@ -673,7 +678,7 @@ pub fn local_only_songs(
         ),
         LocalFilter::Album { artist, album } => (
             format!(
-                "SELECT {columns} FROM local_track t WHERE {LOCAL_ONLY}
+                "SELECT {columns} FROM local_track t {ANALYSED} WHERE {LOCAL_ONLY}
                  AND {ARTIST_OF} = ?2 COLLATE NOCASE AND {ALBUM_OF} = ?3 COLLATE NOCASE {order}"
             ),
             artist.clone(),
@@ -683,7 +688,7 @@ pub fn local_only_songs(
             let pattern = format!("%{}%", like_escape(text.trim()));
             (
                 format!(
-                    "SELECT {columns} FROM local_track t WHERE {LOCAL_ONLY}
+                    "SELECT {columns} FROM local_track t {ANALYSED} WHERE {LOCAL_ONLY}
                      AND (t.title LIKE ?2 ESCAPE '\\' OR t.artist LIKE ?2 ESCAPE '\\'
                           OR t.album LIKE ?2 ESCAPE '\\' OR t.rel_path LIKE ?2 ESCAPE '\\')
                      AND ?3 = ?3 {order}"
@@ -694,7 +699,7 @@ pub fn local_only_songs(
         }
         LocalFilter::Id(id) => (
             format!(
-                "SELECT {columns} FROM local_track t WHERE {LOCAL_ONLY}
+                "SELECT {columns} FROM local_track t {ANALYSED} WHERE {LOCAL_ONLY}
                  AND t.id = CAST(?2 AS INTEGER) AND ?3 = ?3 {order}"
             ),
             id.to_string(),

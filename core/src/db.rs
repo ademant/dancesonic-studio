@@ -31,6 +31,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0007_remote_devices.sql"),
     include_str!("migrations/0008_remote_settings.sql"),
     include_str!("migrations/0009_remote_relay.sql"),
+    include_str!("migrations/0010_local_analysis.sql"),
 ];
 
 /// The schema version this build creates and understands.
@@ -624,6 +625,77 @@ pub(crate) mod tests {
         assert!(
             conn.execute("UPDATE remote_settings SET relay = 2", [])
                 .is_err()
+        );
+    }
+
+    /// Step 9 → 10 keeps the local library and adds its analysis, whose rows
+    /// go with their track, and the analysis settings.
+    #[test]
+    fn migration_9_to_10_keeps_tracks_and_adds_their_analysis() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 9).unwrap();
+        conn.execute_batch(
+            "INSERT INTO local_folder (id, path, added_at) VALUES (1, '/music', 1);
+             INSERT INTO local_track (id, folder_id, rel_path, size_bytes, modified_ms,
+                 fingerprint, bpm, scanned_at)
+                 VALUES (7, 1, 'a/tune.flac', 10, 20, printf('%064d', 0), 120.0, 1);",
+        )
+        .unwrap();
+        migrate_to(&mut conn, 10).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 10);
+        let bpm: f64 = conn
+            .query_row("SELECT bpm FROM local_track WHERE id = 7", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bpm, 120.0, "tracks kept");
+
+        let insert = |sql: &str| {
+            conn.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO local_analysis (track_id, tool_version, size_bytes,
+                         modified_ms, analysed_at, {sql})"
+                ),
+                [],
+            )
+        };
+        insert("bpm, key_pitch, key_mode, waveform) VALUES (7, '0.5.0', 10, 20, 1, 96.5, 9, 1, x'00ff'")
+            .unwrap();
+        insert("error) VALUES (7, '0.5.0', 10, 20, 1, 'no audio'").unwrap();
+        for bad in [
+            "bpm) VALUES (7, '0.5.0', 10, 20, 1, 400",
+            "key_pitch) VALUES (7, '0.5.0', 10, 20, 1, 3",
+            "key_pitch, key_mode) VALUES (7, '0.5.0', 10, 20, 1, 12, 0",
+            "error, bpm) VALUES (7, '0.5.0', 10, 20, 1, 'failed', 100",
+            "beats) VALUES (7, '0.5.0', 10, 20, 1, 'not json'",
+            "bpm) VALUES (8, '0.5.0', 10, 20, 1, 100",
+        ] {
+            assert!(insert(bad).is_err(), "{bad} is refused");
+        }
+        conn.execute("DELETE FROM local_track", []).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM local_analysis", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "results go with their track");
+
+        let settings = crate::analysis::settings(&conn).unwrap();
+        assert_eq!(settings.folksentia, None);
+        assert_eq!(settings.parallel, 2);
+        assert!(
+            conn.execute("UPDATE analysis_settings SET folksentia = 'folksentia'", [])
+                .is_err(),
+            "only an absolute program path"
+        );
+        assert!(
+            conn.execute("UPDATE analysis_settings SET parallel = 0", [])
+                .is_err()
+        );
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .next()
+                .is_none()
         );
     }
 
