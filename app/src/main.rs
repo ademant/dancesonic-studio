@@ -4,6 +4,7 @@ mod analysis_dialog;
 mod ble_remote;
 mod connection_dialog;
 mod folders_dialog;
+mod match_dialog;
 mod mpris;
 mod player;
 mod remote;
@@ -11,6 +12,7 @@ mod remote_dialog;
 mod secret_service;
 mod seek_bar;
 mod session;
+mod tag_dialog;
 mod track_feed;
 mod window;
 

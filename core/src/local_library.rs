@@ -4,8 +4,8 @@
 //! A scan walks a folder, reads the tags of new or changed files with `lofty`
 //! and records each file by its path relative to the folder. A file that moved
 //! or was renamed is found again by its fingerprint, so it keeps its row. A
-//! file that is gone loses its row. Studio never changes or deletes a file on
-//! disk.
+//! file that is gone loses its row. Studio never deletes a file on disk, and
+//! changes one only through the tag editor ([`crate::tag_editor`], #15).
 //!
 //! Symbolic links are not followed, so a scan never leaves the folder, and a
 //! path read back from the database is checked to be inside its folder before
@@ -432,6 +432,80 @@ fn write_track(
     Ok(())
 }
 
+/// A file as it is on disk now: what a scan would record for it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FileState {
+    pub(crate) size: u64,
+    pub(crate) modified_ms: i64,
+    pub(crate) fingerprint: String,
+    pub(crate) tags: LocalTags,
+}
+
+/// The size and modification time of a file, as a scan records them.
+pub(crate) fn size_and_time(path: &Path) -> Result<(u64, i64), LocalError> {
+    let meta = fs::metadata(path).map_err(|source| LocalError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    Ok((meta.len(), modified_ms(&meta)))
+}
+
+/// Reads a file the way a scan does. Blocks.
+pub(crate) fn file_state(path: &Path) -> Result<FileState, LocalError> {
+    let (size, modified_ms) = size_and_time(path)?;
+    let fingerprint = fingerprint(path, size).map_err(|source| LocalError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    Ok(FileState {
+        size,
+        modified_ms,
+        fingerprint,
+        tags: read_tags(path)?,
+    })
+}
+
+/// Records a file Studio itself just changed (the tag editor, #15). Only
+/// tags changed, not the audio, so an analysis stored for the file as it was
+/// (`before`: size and modification time) is kept for the file as it is now,
+/// instead of asking for the track to be analysed again.
+pub(crate) fn record_written(
+    tx: &rusqlite::Transaction<'_>,
+    track_id: i64,
+    state: &FileState,
+    before: (u64, i64),
+    now_ms: i64,
+) -> Result<(), DbError> {
+    let scanned = Scanned {
+        rel_path: String::new(),
+        size: state.size,
+        modified_ms: state.modified_ms,
+        fingerprint: state.fingerprint.clone(),
+        tags: state.tags.clone(),
+    };
+    // `rel_path` is not used for an update; the file stays where it is.
+    let folder: i64 = tx.query_row(
+        "SELECT folder_id FROM local_track WHERE id = ?1",
+        [track_id],
+        |r| r.get(0),
+    )?;
+    write_track(tx, folder, Some(track_id), &scanned, now_ms)?;
+    let old_size = i64::try_from(before.0).unwrap_or(i64::MAX);
+    let new_size = i64::try_from(state.size).unwrap_or(i64::MAX);
+    tx.prepare_cached(
+        "UPDATE local_analysis SET size_bytes = ?4, modified_ms = ?5
+         WHERE track_id = ?1 AND size_bytes = ?2 AND modified_ms = ?3",
+    )?
+    .execute(params![
+        track_id,
+        old_size,
+        before.1,
+        new_size,
+        state.modified_ms
+    ])?;
+    Ok(())
+}
+
 /// Collects the audio files under `dir`. Symbolic links, hidden entries and
 /// names that are not UTF-8 are skipped.
 fn walk(root: &Path, dir: &Path, depth: usize, found: &mut Vec<Found>) {
@@ -849,4 +923,4 @@ fn debounce(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

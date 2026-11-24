@@ -32,6 +32,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0008_remote_settings.sql"),
     include_str!("migrations/0009_remote_relay.sql"),
     include_str!("migrations/0010_local_analysis.sql"),
+    include_str!("migrations/0011_tag_undo.sql"),
 ];
 
 /// The schema version this build creates and understands.
@@ -689,6 +690,71 @@ pub(crate) mod tests {
             conn.execute("UPDATE analysis_settings SET parallel = 0", [])
                 .is_err()
         );
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    /// Step 10 → 11 keeps tracks and their analysis and adds the undo record
+    /// of the tag editor, which holds only a JSON object per existing track.
+    #[test]
+    fn migration_10_to_11_keeps_tracks_and_adds_the_tag_undo() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 10).unwrap();
+        conn.execute_batch(
+            "INSERT INTO local_folder (id, path, added_at) VALUES (1, '/music', 1);
+             INSERT INTO local_track (id, folder_id, rel_path, size_bytes, modified_ms,
+                 fingerprint, title, scanned_at)
+                 VALUES (7, 1, 'a/tune.flac', 10, 20, printf('%064d', 0), 'Tune', 1);
+             INSERT INTO local_analysis (track_id, tool_version, size_bytes, modified_ms,
+                 analysed_at, bpm) VALUES (7, '0.5.0', 10, 20, 1, 96.5);",
+        )
+        .unwrap();
+        migrate_to(&mut conn, 11).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 11);
+        let (title, bpm): (String, f64) = conn
+            .query_row(
+                "SELECT t.title, a.bpm FROM local_track t JOIN local_analysis a
+                 ON a.track_id = t.id WHERE t.id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (title.as_str(), bpm),
+            ("Tune", 96.5),
+            "tracks and analysis kept"
+        );
+
+        let insert = |values: &str| {
+            conn.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO tag_undo (track_id, size_bytes, modified_ms, before,
+                         written_at) VALUES ({values})"
+                ),
+                [],
+            )
+        };
+        insert(r#"7, 11, 21, '{"title":"Tune","album":null}', 2"#).unwrap();
+        for bad in [
+            "7, 11, 21, 'not json', 2",
+            "7, 11, 21, '[1,2]', 2",
+            "7, -1, 21, '{}', 2",
+            "8, 11, 21, '{}', 2",
+        ] {
+            assert!(insert(bad).is_err(), "{bad} is refused");
+        }
+        conn.execute("DELETE FROM local_track", []).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM tag_undo", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "the undo goes with its track");
         assert!(
             conn.prepare("PRAGMA foreign_key_check")
                 .unwrap()
