@@ -100,7 +100,7 @@ impl Qualifier {
 
     /// Reads a qualifier. An unknown one is dropped rather than failing the
     /// whole answer: the tag itself is still true.
-    fn parse(text: &str) -> Option<Self> {
+    pub fn parse(text: &str) -> Option<Self> {
         match text {
             "learn" => Some(Self::Learn),
             "disco" => Some(Self::Disco),
@@ -282,6 +282,23 @@ impl DanceBrainz {
             return Ok(0);
         }
         let answers = self.lookup(&wanted).await?;
+        let count = answers.len();
+        tokio::task::spawn_blocking(move || db.write(|tx| store(tx, &answers, now)))
+            .await
+            .map_err(|_| RefreshError::Task)??;
+        Ok(count)
+    }
+}
+
+impl DanceBrainz {
+    /// Reads `mbids` again now, however fresh the cache is: after a change
+    /// was sent (#16), the cache must show what DanceBrainz has.
+    pub async fn reload(&self, db: Arc<Database>, mbids: Vec<Mbid>) -> Result<usize, RefreshError> {
+        if mbids.is_empty() {
+            return Ok(0);
+        }
+        let now = now_ms();
+        let answers = self.lookup(&mbids).await?;
         let count = answers.len();
         tokio::task::spawn_blocking(move || db.write(|tx| store(tx, &answers, now)))
             .await
@@ -803,6 +820,25 @@ mod tests {
         );
         let conn = db.reader().unwrap();
         assert_eq!(dances_of(&conn, &mbid(A)).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reload_asks_even_when_the_cache_is_fresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/recordings/lookup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer_for(&[A])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let (_dir, db) = temp_database();
+        let dance = dancebrainz(&server).await;
+        dance.refresh(Arc::clone(&db), vec![mbid(A)]).await.unwrap();
+        assert_eq!(
+            dance.reload(Arc::clone(&db), vec![mbid(A)]).await.unwrap(),
+            1
+        );
+        assert_eq!(dance.reload(Arc::clone(&db), Vec::new()).await.unwrap(), 0);
     }
 
     #[tokio::test]

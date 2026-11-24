@@ -29,6 +29,8 @@ use crate::{
     Banner, Services, analysis_dialog, connection_dialog, folders_dialog, match_dialog, tag_dialog,
 };
 
+mod dances;
+mod handoff;
 mod remote_commands;
 
 /// How often the position is read from the engine.
@@ -110,6 +112,8 @@ struct Detail {
     length: gtk::Label,
     tempo: gtk::Label,
     dances: gtk::Label,
+    /// The meter and sub-meter from DanceBrainz (#16).
+    meter: gtk::Label,
     shoes: gtk::Label,
     playlist_choice: gtk::DropDown,
     playlist_names: gtk::StringList,
@@ -117,6 +121,8 @@ struct Detail {
     add_button: gtk::Button,
     /// "Edit tags…" of a track with a local file (#15).
     edit_tags: gtk::Button,
+    /// "Edit dances…" of a track with a MusicBrainz ID (#16).
+    edit_dances: gtk::Button,
     song: RefCell<Option<Song>>,
 }
 
@@ -282,6 +288,14 @@ impl Window {
         remote_button.connect_clicked(move |_| {
             if let Some(me) = weak.upgrade() {
                 me.show_remote();
+            }
+        });
+        header.pack_end(&me.handoff_menu());
+        header.pack_end(&me.dancebrainz_button());
+        let weak = Rc::downgrade(&me);
+        me.detail.edit_dances.connect_clicked(move |_| {
+            if let Some(me) = weak.upgrade() {
+                me.edit_dances();
             }
         });
         me.show_detail(None);
@@ -581,6 +595,7 @@ impl Window {
     pub(crate) fn set_services(self: &Rc<Self>, services: Services) {
         self.start_remote(&services);
         *self.services.borrow_mut() = Some(services);
+        self.start_dance_edits();
         self.open_session();
         self.watch_folders();
     }
@@ -1252,11 +1267,13 @@ impl Window {
         let Some(song) = song else {
             d.title.set_text("No track selected");
             for label in [
-                &d.artist, &d.album, &d.length, &d.tempo, &d.dances, &d.shoes,
+                &d.artist, &d.album, &d.length, &d.tempo, &d.dances, &d.meter, &d.shoes,
             ] {
                 label.set_text("");
+                label.set_tooltip_text(None);
             }
             d.edit_tags.set_sensitive(false);
+            d.edit_dances.set_sensitive(false);
             self.update_add_button();
             return;
         };
@@ -1277,29 +1294,13 @@ impl Window {
             Some(bpm) => format!("{bpm:.0} BPM"),
             None => "Tempo not known".to_owned(),
         });
-        d.dances.set_text("…");
-        // Shoe ratings come with #16 (phase 4).
-        d.shoes.set_text("Not rated yet");
         self.update_add_button();
+        self.show_dance_facts(&song);
 
         let Some(session) = self.session.borrow().clone() else {
             return;
         };
         let expected = song.id.clone();
-        let reader = session.clone();
-        let mbid = song.mbid.clone();
-        self.spawn(async move { reader.dances_of(mbid).await }, {
-            let expected = expected.clone();
-            move |me, names| {
-                if me.detail_is(&expected) {
-                    me.detail.dances.set_text(&if names.is_empty() {
-                        "No dance known".to_owned()
-                    } else {
-                        names.join(", ")
-                    });
-                }
-            }
-        });
         if let Some(cover) = song.cover_art.clone() {
             self.spawn(
                 async move { session.cover(cover).await },
@@ -1835,6 +1836,7 @@ impl Detail {
         let length = label(&[]);
         let tempo = label(&[]);
         let dances = label(&[]);
+        let meter = label(&[]);
         let shoes = label(&[]);
         let playlist_names = gtk::StringList::new(&[]);
         let playlist_choice = gtk::DropDown::builder()
@@ -1849,6 +1851,12 @@ impl Detail {
             .halign(gtk::Align::Start)
             .sensitive(false)
             .tooltip_text("Change the tags in this track's local file")
+            .build();
+        let edit_dances = gtk::Button::builder()
+            .label("Edit dances…")
+            .halign(gtk::Align::Start)
+            .sensitive(false)
+            .tooltip_text("Change the dances, meter and shoes on DanceBrainz")
             .build();
 
         let grid = gtk::Grid::builder()
@@ -1870,6 +1878,7 @@ impl Detail {
         put("Length", length.upcast_ref());
         put("Tempo", tempo.upcast_ref());
         put("Dance", dances.upcast_ref());
+        put("Meter", meter.upcast_ref());
         put("Shoes", shoes.upcast_ref());
         let add_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         add_row.append(&playlist_choice);
@@ -1891,6 +1900,7 @@ impl Detail {
         column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         column.append(&grid);
         column.append(&edit_tags);
+        column.append(&edit_dances);
         let widget = gtk::ScrolledWindow::builder()
             .child(&column)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1905,12 +1915,14 @@ impl Detail {
             length,
             tempo,
             dances,
+            meter,
             shoes,
             playlist_choice,
             playlist_names,
             playlist_ids: RefCell::default(),
             add_button,
             edit_tags,
+            edit_dances,
             song: RefCell::default(),
         }
     }

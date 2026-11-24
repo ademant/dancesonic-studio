@@ -33,6 +33,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0009_remote_relay.sql"),
     include_str!("migrations/0010_local_analysis.sql"),
     include_str!("migrations/0011_tag_undo.sql"),
+    include_str!("migrations/0012_dance_edits.sql"),
 ];
 
 /// The schema version this build creates and understands.
@@ -690,6 +691,66 @@ pub(crate) mod tests {
             conn.execute("UPDATE analysis_settings SET parallel = 0", [])
                 .is_err()
         );
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    /// Version 12 adds the DanceBrainz pairing and the edit queue (#16). It
+    /// keeps the dance cache and checks what the queue may hold.
+    #[test]
+    fn migration_11_to_12_keeps_the_dance_cache_and_adds_the_edit_queue() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate_to(&mut conn, 11).unwrap();
+        let mbid = "0f8b7c4e-2a7b-4a8e-9a42-3d7c5b1e9f10";
+        conn.execute_batch(&format!(
+            "INSERT INTO dance_lookup (mbid, fetched_at) VALUES ('{mbid}', 1);
+             INSERT INTO dance_tag (mbid, tag_id, kind, name, path, qualifier, updated_at)
+                 VALUES ('{mbid}', 4, 'dance', 'Bourrée', '[\"Bourrée\"]', 'both', 'x');"
+        ))
+        .unwrap();
+        migrate_to(&mut conn, 12).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 12);
+        let name: String = conn
+            .query_row("SELECT name FROM dance_tag WHERE tag_id = 4", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "Bourrée", "the dance cache is kept");
+
+        conn.execute(
+            "INSERT INTO dancebrainz_device (server, device_id, approved, paired_at)
+             VALUES ('https://dancebrainz.example/', 3, 0, 1)",
+            [],
+        )
+        .unwrap();
+        let insert = |values: &str| {
+            conn.execute(
+                &format!(
+                    "INSERT INTO dance_edit (mbid, field, edit, state, queued_at) VALUES ({values})"
+                ),
+                [],
+            )
+        };
+        insert(&format!(
+            r#"'{mbid}', 'shoes', '{{"set_shoes":3}}', 'queued', 2"#
+        ))
+        .unwrap();
+        for bad in [
+            format!("'{mbid}', 'tempo', '{{}}', 'queued', 2"),
+            format!("'{mbid}', 'shoes', 'not json', 'queued', 2"),
+            format!("'{mbid}', 'shoes', '[1]', 'queued', 2"),
+            format!("'{mbid}', 'shoes', '{{}}', 'sent', 2"),
+            "'short', 'shoes', '{}', 'queued', 2".to_owned(),
+        ] {
+            assert!(insert(&bad).is_err(), "{bad} must be refused");
+        }
         assert!(
             conn.prepare("PRAGMA foreign_key_check")
                 .unwrap()

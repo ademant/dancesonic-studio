@@ -411,7 +411,7 @@ fn now_ms() -> i64 {
 
 /// Parses an RFC 3339 timestamp such as `2026-11-19T12:00:00Z` into epoch
 /// milliseconds. Accepts `Z` and numeric offsets, with optional fractions.
-fn parse_rfc3339_ms(text: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339_ms(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
         return None;

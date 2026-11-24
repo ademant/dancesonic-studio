@@ -299,6 +299,17 @@ impl Window {
 
     /// Replaces the queue with `songs` and plays from `start`.
     fn load_songs(self: &Rc<Self>, songs: Vec<Song>, start: usize) -> Result<(), &'static str> {
+        self.load_songs_at(songs, start, 0)
+    }
+
+    /// Replaces the queue with `songs` and plays from `start`, `position_ms`
+    /// into that song.
+    pub(super) fn load_songs_at(
+        self: &Rc<Self>,
+        songs: Vec<Song>,
+        start: usize,
+        position_ms: u64,
+    ) -> Result<(), &'static str> {
         let (songs, tracks): (Vec<Song>, Vec<Track>) = songs
             .into_iter()
             .filter_map(|s| track_of(&s).map(|t| (s, t)))
@@ -308,7 +319,7 @@ impl Window {
         }
         let start = start.min(songs.len() - 1);
         *self.queue.borrow_mut() = songs;
-        self.with_player(|p| p.load(tracks, start));
+        self.with_player(|p| p.load_at(tracks, start, position_ms));
         Ok(())
     }
 

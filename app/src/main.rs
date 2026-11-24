@@ -3,6 +3,9 @@
 mod analysis_dialog;
 mod ble_remote;
 mod connection_dialog;
+mod contribute;
+mod dance_dialog;
+mod dancebrainz_dialog;
 mod folders_dialog;
 mod match_dialog;
 mod mpris;
