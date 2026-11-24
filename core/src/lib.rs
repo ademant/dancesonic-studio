@@ -14,6 +14,7 @@ pub mod connection;
 pub mod dancebrainz;
 pub mod db;
 pub mod dpop;
+pub mod handoff;
 pub mod http;
 pub mod library_feed;
 pub mod local_library;

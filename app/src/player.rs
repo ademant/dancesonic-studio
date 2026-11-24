@@ -72,6 +72,9 @@ struct Inner {
     /// The rate still has to be applied: a seek is refused while the pipeline
     /// changes state, so it waits for the next async-done.
     rate_pending: bool,
+    /// Where the new track should start (#18), applied with the rate at the
+    /// next async-done for the same reason.
+    start_pending: Option<u64>,
     /// The user's volume, 0 to 1, applied on top of ReplayGain.
     volume: f64,
     /// The user paused. Buffering must not resume a pause the user asked for.
@@ -160,6 +163,7 @@ impl Player {
             feeds: Feeds::default(),
             rate: Rate::NORMAL,
             rate_pending: false,
+            start_pending: None,
             volume: 1.0,
             user_paused: false,
             on_event: Rc::new(on_event),
@@ -226,12 +230,16 @@ impl Player {
                     gst::MessageView::AsyncDone(_) => {
                         let pending = {
                             let mut state = inner.borrow_mut();
-                            std::mem::take(&mut state.rate_pending).then_some(state.rate)
+                            let start = state.start_pending.take();
+                            let rate = std::mem::take(&mut state.rate_pending);
+                            (rate || start.is_some()).then_some((state.rate, start))
                         };
-                        if let (Some(rate), Some(playbin)) = (pending, weak.upgrade()) {
-                            let position = playbin
-                                .query_position::<gst::ClockTime>()
-                                .map_or(0, gst::ClockTime::mseconds);
+                        if let (Some((rate, start)), Some(playbin)) = (pending, weak.upgrade()) {
+                            let position = start.unwrap_or_else(|| {
+                                playbin
+                                    .query_position::<gst::ClockTime>()
+                                    .map_or(0, gst::ClockTime::mseconds)
+                            });
                             if let Err(error) = seek_with_rate(&playbin, position, rate) {
                                 tracing::warn!(%error, "the speed could not be applied");
                             }
@@ -268,13 +276,28 @@ impl Player {
 
     /// Replaces the queue and starts playing at `start`.
     pub(crate) fn load(&mut self, tracks: Vec<Track>, start: usize) -> Result<(), PlayerError> {
+        self.load_at(tracks, start, 0)
+    }
+
+    /// Replaces the queue and starts playing at `start`, `position_ms` into
+    /// that song, as a queue handed over from another device goes on (#18).
+    pub(crate) fn load_at(
+        &mut self,
+        tracks: Vec<Track>,
+        start: usize,
+        position_ms: u64,
+    ) -> Result<(), PlayerError> {
         {
             let mut inner = self.inner.borrow_mut();
             let songs = tracks.iter().map(|t| t.song.clone()).collect();
             inner.queue.replace(songs, start)?;
             inner.tracks = tracks;
         }
-        self.play_current()
+        self.play_current()?;
+        if position_ms > 0 {
+            self.inner.borrow_mut().start_pending = Some(position_ms);
+        }
+        Ok(())
     }
 
     /// Adds songs at the end of the queue without interrupting playback.
@@ -308,6 +331,7 @@ impl Player {
             let mut inner = self.inner.borrow_mut();
             inner.user_paused = false;
             inner.rate_pending = rate != Rate::NORMAL;
+            inner.start_pending = None;
         }
         self.playbin
             .set_state(gst::State::Null)

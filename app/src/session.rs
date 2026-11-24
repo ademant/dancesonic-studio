@@ -10,6 +10,7 @@ use studio_core::connect;
 use studio_core::connection::{HttpPolicy, ServerUrl};
 use studio_core::dancebrainz::{self, Dance, DanceBrainz, Mbid};
 use studio_core::db::Database;
+use studio_core::handoff;
 use studio_core::http::{self, HttpSettings};
 use studio_core::library_feed::LibrarySource;
 use studio_core::local_library::{self, LocalArtist, LocalFilter, LocalFolder, ScanReport};
@@ -466,6 +467,50 @@ impl Session {
 
     /// Adds a song to a playlist on the server, then syncs so the local
     /// playlist matches.
+    /// Saves the queue on the server for another device (#18): the songs the
+    /// server has, around the one at `current`, and `position_ms` into it.
+    /// Returns how many songs were saved. Local-only songs are left out; when
+    /// the one that plays is local-only, the next server song is current.
+    pub(crate) async fn hand_off(
+        &self,
+        queue: Vec<String>,
+        current: usize,
+        position_ms: u64,
+    ) -> Result<usize, String> {
+        let (saved, at, position) =
+            handoff::to_save(&queue, current, position_ms, local_library::LOCAL_ID_PREFIX)
+                .ok_or_else(|| "Nothing from the server plays or is queued after it.".to_owned())?;
+        self.client
+            .save_play_queue(&saved, at, position)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(saved.len())
+    }
+
+    /// The queue another device saved on the server (#18): its songs as the
+    /// library knows them, the index to go on with and the position in that
+    /// song. `None` when nothing is saved or no saved song is known here.
+    pub(crate) async fn saved_queue(&self) -> Result<Option<(Vec<Song>, usize, u64)>, String> {
+        let Some(saved) = self.client.play_queue().await.map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let current = saved
+            .songs
+            .get(saved.current)
+            .map(|s| s.as_str().to_owned());
+        let ids = saved.songs.iter().map(|s| s.as_str().to_owned()).collect();
+        let songs = self.songs(Selection::Ids(ids)).await?;
+        if songs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            match songs.iter().position(|s| Some(&s.id) == current.as_ref()) {
+                Some(index) => (songs, index, saved.position_ms),
+                None => (songs, 0, 0),
+            },
+        ))
+    }
+
     pub(crate) async fn add_to_playlist(
         &self,
         playlist_id: String,

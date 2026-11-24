@@ -29,6 +29,7 @@ use crate::{
     Banner, Services, analysis_dialog, connection_dialog, folders_dialog, match_dialog, tag_dialog,
 };
 
+mod handoff;
 mod remote_commands;
 
 /// How often the position is read from the engine.
@@ -284,6 +285,7 @@ impl Window {
                 me.show_remote();
             }
         });
+        header.pack_end(&me.handoff_menu());
         me.show_detail(None);
         me.update_speed_controls();
         me
