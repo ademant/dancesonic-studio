@@ -394,28 +394,6 @@ impl Session {
         .map_err(|_| "The library task stopped.".to_owned())?
     }
 
-    /// The dance names of a recording, from the cache.
-    pub(crate) async fn dances_of(&self, mbid: Option<String>) -> Vec<String> {
-        let Some(mbid) = mbid.and_then(|m| Mbid::parse(&m).ok()) else {
-            return Vec::new();
-        };
-        let db = Arc::clone(&self.db);
-        let result =
-            tokio::task::spawn_blocking(move || dancebrainz::dances_of(&db.reader()?, &mbid)).await;
-        match result {
-            Ok(Ok(tags)) => tags
-                .into_iter()
-                .filter(|t| t.kind == dancebrainz::DANCE_KIND)
-                .map(|t| t.name)
-                .collect(),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "dances could not be read");
-                Vec::new()
-            }
-            Err(_) => Vec::new(),
-        }
-    }
-
     /// The waveform of a song, when the server has one.
     pub(crate) async fn waveform(&self, song: SongId) -> Option<Waveform> {
         if !self.has_analysis {
